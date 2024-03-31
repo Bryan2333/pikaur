@@ -1,4 +1,6 @@
 """Licensed under GPLv3, see https://www.gnu.org/licenses/"""
+import functools
+import operator
 from itertools import chain
 from multiprocessing.pool import ThreadPool
 from typing import TYPE_CHECKING
@@ -37,7 +39,7 @@ if TYPE_CHECKING:
 logger = create_logger("install_info_fetcher")
 
 
-class InstallInfoFetcher(ComparableType):  # pylint: disable=too-many-public-methods
+class InstallInfoFetcher(ComparableType):  # noqa: PLR0904
 
     repo_packages_install_info: list[RepoInstallInfo]
     new_repo_deps_install_info: list[RepoInstallInfo]
@@ -52,6 +54,7 @@ class InstallInfoFetcher(ComparableType):  # pylint: disable=too-many-public-met
     args: "PikaurArgs"
     aur_deps_relations: dict[str, list[str]]
     replacements: dict[str, list[str]]
+    skip_checkdeps_for_pkgnames: list[str]
 
     __ignore_in_eq__ = ("args", )
 
@@ -61,6 +64,7 @@ class InstallInfoFetcher(ComparableType):  # pylint: disable=too-many-public-met
             not_found_repo_pkgs_names: list[str],
             manually_excluded_packages_names: list[str],
             pkgbuilds_packagelists: dict[str, list[str]],
+            skip_checkdeps_for_pkgnames: list[str] | None = None,
     ) -> None:
         logger.debug(
             """
@@ -69,11 +73,13 @@ Gonna fetch install info for:
     not_found_repo_pkgs_names={}
     pkgbuilds_packagelists={}
     manually_excluded_packages_names={}
+    skip_checkdeps_for_pkgnames={}
 """,
             install_package_names,
             not_found_repo_pkgs_names,
             pkgbuilds_packagelists,
             manually_excluded_packages_names,
+            skip_checkdeps_for_pkgnames,
         )
         self.args = parse_args()
         self.install_package_names = install_package_names
@@ -81,6 +87,7 @@ Gonna fetch install info for:
         self.manually_excluded_packages_names = manually_excluded_packages_names
         self.pkgbuilds_packagelists = pkgbuilds_packagelists
         self.replacements = find_replacements() if self.args.sysupgrade else {}
+        self.skip_checkdeps_for_pkgnames = skip_checkdeps_for_pkgnames or []
 
         self.get_all_packages_info()
         if self.args.sysupgrade:
@@ -91,18 +98,15 @@ Gonna fetch install info for:
             )
 
     def package_is_ignored(self, package_name: str) -> bool:
-        ignored_pkg_names = get_ignored_pkgnames_from_patterns(
-            [package_name],
-            self.args.ignore + PacmanConfig().options.get("IgnorePkg", []),
+        return bool(
+            package_name in get_ignored_pkgnames_from_patterns(
+                [package_name],
+                self.args.ignore + PacmanConfig().options.get("IgnorePkg", []),
+            )
+            and not (
+                package_name in self.install_package_names
+                or package_name in self.not_found_repo_pkgs_names),
         )
-        if (
-                package_name in ignored_pkg_names
-        ) and not (
-            package_name in self.install_package_names or
-            package_name in self.not_found_repo_pkgs_names
-        ):
-            return True
-        return False
 
     def exclude_ignored_packages(
             self,
@@ -111,7 +115,7 @@ Gonna fetch install info for:
             print_packages: bool = True,
     ) -> None:
         ignored_packages = []
-        for pkg_name in package_names[:]:
+        for pkg_name in package_names.copy():
             if self.package_is_ignored(pkg_name):
                 package_names.remove(pkg_name)
                 ignored_packages.append(pkg_name)
@@ -314,7 +318,7 @@ Gonna fetch install info for:
         all_results = {}
         with ThreadPool() as pool:
             pkg_exists_requests = {}
-            for pkg_name in pkg_lines[:]:
+            for pkg_name in pkg_lines.copy():
                 logger.debug("Checking if '{}' exists in the repo:", pkg_name)
                 pkg_exists_requests[pkg_name] = pool.apply_async(
                     PackageDB.get_print_format_output,
@@ -443,7 +447,9 @@ Gonna fetch install info for:
             pkg_info.package
             for pkg_info in self.aur_updates_install_info + self.aur_deps_install_info
         ]
-        new_dep_version_matchers = find_repo_deps_of_aur_pkgs(all_aur_pkgs)
+        new_dep_version_matchers = find_repo_deps_of_aur_pkgs(
+            all_aur_pkgs, skip_checkdeps_for_pkgnames=self.skip_checkdeps_for_pkgnames,
+        )
         new_dep_lines = [
             vm.line for vm in new_dep_version_matchers
         ]
@@ -575,7 +581,9 @@ Gonna fetch install info for:
         if all_aur_pkgs:
             print_stdout(translate("Resolving AUR dependencies..."))
         try:
-            self.aur_deps_relations = find_aur_deps(all_aur_pkgs)
+            self.aur_deps_relations = find_aur_deps(
+                all_aur_pkgs, skip_checkdeps_for_pkgnames=self.skip_checkdeps_for_pkgnames,
+            )
         except DependencyVersionMismatchError as exc:
             if exc.location is not PackageSource.LOCAL:
                 raise
@@ -610,6 +618,7 @@ Gonna fetch install info for:
 
     def mark_dependent(self) -> None:
         """Update packages' install info to show deps in prompt."""
+        logger.debug(":: marking dependant pkgs...")
         all_provided_pkgs = PackageDB.get_repo_provided_dict()
         all_local_pkgnames = PackageDB.get_local_pkgnames()
         all_deps_install_infos: Sequence[InstallInfo] = (
@@ -617,18 +626,26 @@ Gonna fetch install info for:
             self.new_thirdparty_repo_deps_install_info +
             self.aur_deps_install_info  # type: ignore[operator]
         )
-        all_requested_pkg_names = self.install_package_names + sum([
+        all_requested_pkg_names = self.install_package_names + functools.reduce(operator.iadd, [
             (
-                ii.package.depends + ii.package.makedepends + ii.package.checkdepends
+                ii.package.depends + ii.package.makedepends + (
+                    ii.package.checkdepends
+                    if (ii.name not in self.skip_checkdeps_for_pkgnames)
+                    else []
+                )
             ) if isinstance(ii.package, AURPackageInfo) else (
                 ii.package.depends
             )
             for ii in self.all_install_info
         ], [])
+        logger.debug("all_requested_pkg_names={}", all_requested_pkg_names)
         explicit_aur_pkg_names = [ii.name for ii in self.aur_updates_install_info]
+        logger.debug("explicit_aur_pkg_names={}", explicit_aur_pkg_names)
 
         # iterate each package metadata
         for pkg_install_info in self.all_install_info:
+
+            logger.debug(" - {}", pkg_install_info.name)
 
             # process providers
             provides = pkg_install_info.package.provides
@@ -641,15 +658,20 @@ Gonna fetch install info for:
                 pkg_install_info.name not in all_local_pkgnames
             ):
                 providing_for = [
-                    pkg_name for pkg_name in sum([
-                        next(
-                            [vm.line, vm.pkg_name]
-                            for vm in (VersionMatcher(prov), )
-                        )
-                        for prov in provides
-                    ], [])
+                    pkg_name for pkg_name in functools.reduce(
+                        operator.iadd,
+                        [
+                            next(
+                                [vm.line, vm.pkg_name]
+                                for vm in (VersionMatcher(prov), )
+                            )
+                            for prov in provides
+                        ],
+                    )
                     if pkg_name in all_requested_pkg_names
                 ]
+                logger.debug("provides={}", provides, indent=4)
+            logger.debug("providing_for={}", providing_for, indent=4)
             for provided_name in providing_for:
                 if provided_name in all_provided_pkgs:
                     pkg_install_info.name = provided_name
@@ -664,7 +686,11 @@ Gonna fetch install info for:
                 (
                     pkg_install_info.package.depends +
                     pkg_install_info.package.makedepends +
-                    pkg_install_info.package.checkdepends
+                    (
+                        pkg_install_info.package.checkdepends
+                        if (pkg_install_info.name not in self.skip_checkdeps_for_pkgnames)
+                        else []
+                    )
                 ) if (
                     isinstance(pkg_install_info.package, AURPackageInfo)
                 ) else pkg_install_info.package.depends
@@ -694,6 +720,7 @@ Gonna fetch install info for:
                             dep_install_info.provided_by = None
                             dep_install_info.name = name
                             dep_install_info.new_version = dep_install_info.package.version
+        logger.debug("== marked dependant pkgs.")
 
     def get_total_download_size(self) -> float:
         total_download_size = 0.0

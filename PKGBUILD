@@ -2,8 +2,8 @@
 # shellcheck disable=SC2034,SC2154
 
 pkgname=pikaur-git
-pkgver=1.18.3
-pkgrel=1
+pkgver=1.18.4
+pkgrel=2
 pkgdesc="AUR helper which asks all questions before installing/building. Inspired by pacaur, yaourt and yay."
 arch=('any')
 url="https://github.com/actionless/pikaur"
@@ -30,6 +30,7 @@ optdepends=(
 	'devtools: for Arch Pkgs support in -G/--getpkgbuild operation'
 	'python-pysocks: for socks5 proxy support'
 	'python-defusedxml: securely wrap Arch news replies'
+	'pacman-contrib: to use in pacman hook/systemd timer for cleaning up pikaur cache'
 )
 conflicts=('pikaur')
 provides=('pikaur')

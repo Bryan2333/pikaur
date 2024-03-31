@@ -28,9 +28,7 @@ def need_dynamic_users() -> bool:
         return True
     if dynamic_users == "never":
         return False
-    if running_as_root() and dynamic_users == "root":
-        return True
-    return False
+    return bool(running_as_root() and dynamic_users == "root")
 
 
 def using_dynamic_users() -> int:
@@ -106,7 +104,7 @@ def isolate_root_cmd(
 
 def get_args_to_elevate_pikaur(original_args: list[str]) -> list[str]:
     args = parse_args()
-    restart_args = original_args[:]
+    restart_args = original_args.copy()
     extra_args = [
         ("--pikaur-config", str(ConfigPath()())),
     ]

@@ -63,7 +63,7 @@ def find_conflicting_with_new_pkgs(
     """
     local_provided = PackageDB.get_local_provided_dict()
     new_pkgs_conflicts: dict[str, list[str]] = {}
-    for conflict_line in new_pkg_conflicts_list:  # pylint: disable=too-many-nested-blocks
+    for conflict_line in new_pkg_conflicts_list:  # noqa: PLR1702:
         conflict_version_matcher = VersionMatcher(conflict_line, is_pkg_deps=True)
         conflict_pkg_name = conflict_version_matcher.pkg_name
         if new_pkg_name != conflict_pkg_name:
@@ -121,10 +121,13 @@ def find_conflicting_with_local_pkgs(
 def find_aur_conflicts(
         aur_pkgs_install_infos: "Sequence[AURInstallInfo]",
         repo_packages_names: list[str],
+        skip_checkdeps_for_pkgnames: list[str],
 ) -> dict[str, list[str]]:
     aur_pkgs: list[AURPackageInfo] = [ii.package for ii in aur_pkgs_install_infos]
     aur_packages_names = [ii.name for ii in aur_pkgs_install_infos]
-    repo_deps_version_matchers = find_repo_deps_of_aur_pkgs(aur_pkgs)
+    repo_deps_version_matchers = find_repo_deps_of_aur_pkgs(
+        aur_pkgs, skip_checkdeps_for_pkgnames=skip_checkdeps_for_pkgnames,
+    )
     repo_deps_names = [vm.pkg_name for vm in repo_deps_version_matchers]
     all_pkgs_to_be_installed = aur_packages_names + repo_deps_names
 

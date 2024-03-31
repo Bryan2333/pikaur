@@ -124,7 +124,7 @@ def copy_aur_repo(from_path: Path, to_path: Path) -> None:
             raise RuntimeError(translate(f"Can't copy '{from_path}' to '{to_path}'."))
 
 
-class PackageBuild(DataType):  # pylint: disable=too-many-public-methods
+class PackageBuild(DataType):  # noqa: PLR0904
     # pylint: disable=too-many-instance-attributes
     clone = False
     pull = False
@@ -446,11 +446,9 @@ class PackageBuild(DataType):  # pylint: disable=too-many-public-methods
                 srcinfo = SrcInfo(
                     pkgbuild_path=pkg_build.pkgbuild_path, package_name=pkg_name,
                 )
-                all_provided_pkgnames.update({
-                    provided_name: pkg_name
-                    for provided_name in
-                    [pkg_name, *srcinfo.get_values("provides")]
-                })
+                all_provided_pkgnames.update(
+                    dict.fromkeys([pkg_name, *srcinfo.get_values("provides")], pkg_name),
+                )
 
         self.built_deps_to_install = {}
 
@@ -810,7 +808,11 @@ class PackageBuild(DataType):  # pylint: disable=too-many-public-methods
         print_stdout()
         return result
 
-    def build_with_makepkg(self) -> bool:  # pylint: disable=too-many-branches,too-many-statements
+    def build_with_makepkg(  # pylint: disable=too-many-branches,too-many-statements
+            self,
+            *,
+            skip_check: bool = False,
+    ) -> bool:
         makepkg_args = []
         if not self.args.needed:
             makepkg_args.append("--force")
@@ -824,7 +826,6 @@ class PackageBuild(DataType):  # pylint: disable=too-many-public-methods
         build_succeeded = False
         skip_pgp_check = False
         skip_file_checksums = False
-        skip_check = False
         no_prepare = False
         while True:
             result = self._run_makepkg_cmd(
@@ -929,6 +930,7 @@ class PackageBuild(DataType):  # pylint: disable=too-many-public-methods
             self,
             all_package_builds: dict[str, "PackageBuild"],
             resolved_conflicts: list[list[str]],
+            skip_checkfunc_for_pkgnames: list[str],
     ) -> None:
         self.resolved_conflicts = resolved_conflicts
 
@@ -936,7 +938,15 @@ class PackageBuild(DataType):  # pylint: disable=too-many-public-methods
 
         self.install_all_deps(all_package_builds)
         try:
-            build_succeeded = True if self.check_if_already_built() else self.build_with_makepkg()
+            skip_check = False
+            for pkg_name in self.package_names:
+                if pkg_name in skip_checkfunc_for_pkgnames:
+                    skip_check = True
+            build_succeeded = (
+                True
+                if self.check_if_already_built()
+                else self.build_with_makepkg(skip_check=skip_check)
+            )
         finally:
             self._remove_installed_deps()
 

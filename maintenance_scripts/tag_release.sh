@@ -81,7 +81,7 @@ echo
 if [[ "${answer}" = "y" ]] ; then
 	git add PKGBUILD .SRCINFO CHANGELOG
 	git commit -m "update to ${new_version}"
-	git push origin HEAD
+	GIT_SSH_COMMAND="ssh -i ~/.ssh/aur" git push origin HEAD
 fi
 answer=
 
@@ -115,7 +115,7 @@ echo
 if [[ "${answer}" = "y" ]] ; then
 	git add PKGBUILD .SRCINFO CHANGELOG
 	git commit -m "update to ${new_version}"
-	git push origin HEAD
+	GIT_SSH_COMMAND="ssh -i ~/.ssh/aur" git push origin HEAD
 fi
 answer=
 
@@ -130,7 +130,7 @@ echo
 if [[ "${answer}" = "y" ]] ; then
 	cd "${src_repo_dir}"
 	rm -fr ./dist
-	python -m build --no-isolation
+	python -m build --wheel --no-isolation
 	twine check ./dist/*.whl
 	twine upload ./dist/*.whl
 fi

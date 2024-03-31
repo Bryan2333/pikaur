@@ -140,7 +140,12 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
 ) -> str:
     parent_color = color
 
-    def _color_line(line: str, color: int, reset: bool | None = None) -> str:
+    def _color_line(
+            line: str,
+            color: int,
+            *,
+            reset: bool | None = None,
+    ) -> str:
         if not parent_color:
             return line
         if reset is not None:
@@ -157,7 +162,7 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
         tuple[int, str] | str
     )
 
-    def pretty_format(  # pylint:disable=too-many-locals,R0912
+    def pretty_format(  # pylint:disable=R0912  # noqa: PLR0914
             pkg_update: "InstallInfo",
     ) -> tuple[str, type_sort_key]:
         common_version, diff_weight = get_common_version(
@@ -248,7 +253,7 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
                 user_config.sync.ShowDownloadSize.get_bool() and
                 isinstance(pkg_update.package, pyalpm.Package)
         ):
-            pkg_size = f"{pkg_update.package.size/1024/1024:.2f} MiB"
+            pkg_size = f"{pkg_update.package.size / 1024 / 1024:.2f} MiB"
 
         days_old = ""
         if pkg_update.devel_pkg_age_days:
@@ -397,6 +402,7 @@ class SysupgradePrettyFormatter:
     def pretty_format_upgradeable(
             self,
             install_infos: "Sequence[InstallInfo]",
+            *,
             print_repo: bool | None = None,
     ) -> str:
         if print_repo is None:
@@ -667,8 +673,8 @@ def print_ignoring_outofdate_upgrade(package_info: InstallInfo) -> None:
     )
 
 
-# pylint:disable=too-many-locals,too-many-statements,too-many-branches
-def print_package_search_results(
+# pylint:disable=too-many-statements,too-many-branches
+def print_package_search_results(  # noqa: PLR0914
         repo_packages: "Iterable[pyalpm.Package]",
         aur_packages: "Iterable[AURPackageInfo]",
         local_pkgs_versions: dict[str, str],
@@ -725,13 +731,13 @@ def print_package_search_results(
 
     enumerated_packages = list(enumerate(sorted_packages))
     if user_config.ui.ReverseSearchSorting.get_bool():
-        enumerated_packages = list(reversed(enumerated_packages))
+        enumerated_packages.reverse()
 
     for pkg_idx, package in enumerated_packages:
         # @TODO: return only packages for the current architecture
         idx = ""
         if enumerated:
-            idx = bold_line(f"{pkg_idx+1}) ")
+            idx = bold_line(f"{pkg_idx + 1}) ")
 
         pkg_name = package.name
         if args.quiet:
@@ -808,15 +814,10 @@ def print_package_search_results(
                     ColorsHighlight.black,
                 )
 
-            print_stdout("{}{}{} {} {}{}{}{}".format(  # pylint: disable=consider-using-f-string
-                idx,
-                repo,
-                bold_line(pkg_name),
-                color_line(version, version_color),
-                groups,
-                installed,
-                rating,
-                last_updated,
-            ))
+            print_stdout(
+                f"{idx}{repo}{bold_line(pkg_name)}"
+                f" {color_line(version, version_color)}"
+                f" {groups}{installed}{rating}{last_updated}",
+            )
             print_stdout(format_paragraph(f"{package.desc}"))
     return sorted_packages

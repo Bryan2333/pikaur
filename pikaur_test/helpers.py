@@ -90,14 +90,11 @@ class CmdResult:
             f"{self.stdout}\n"
         )
 
+    def __hash__(self) -> int:
+        return hash(repr(self))
+
     def __eq__(self, other: "CmdResult") -> bool:  # type: ignore[override]
-        return ((
-            self.stdout == other.stdout
-        ) and (
-            self.stderr == other.stderr
-        ) and (
-            self.returncode == other.returncode
-        ))
+        return hash(self) == hash(other)
 
 
 class FakeExit(Exception):  # noqa: N818
@@ -210,8 +207,10 @@ def pikaur(
     if "--mflags" in cmd:
         for arg in new_args[::]:
             if arg.startswith("--mflags"):
-                for mflag in arg.split("=", maxsplit=1)[1].split(","):
-                    mflags.append(mflag)
+                mflags.extend(
+                    mflag
+                    for mflag in arg.split("=", maxsplit=1)[1].split(",")
+                )
                 new_args.remove(arg)
                 break
     if mflags:
@@ -332,8 +331,8 @@ class PikaurDbTestCase(PikaurTestCase):
             if pkg_is_installed(pkg_name):
                 self.remove_packages(pkg_name)
 
-    def _checkout_older_version(  # pylint: disable=too-many-arguments
-            self,
+    @staticmethod
+    def _checkout_older_version(
             repo_dir: str,
             build_dir: str,
             pkg_name: str,

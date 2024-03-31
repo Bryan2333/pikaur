@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PYTHON=python3
+script_dir=$(readlink -e "$(dirname "${0}")")
+APP_DIR="$(readlink -e "${script_dir}"/..)"
 
 
 FIX_MODE=0
 while getopts f name
 do
-   case $name in
-   f)   FIX_MODE=1;;
-   ?)   printf "Usage: %s: [-f] [TARGETS]\n" "$0"
-	   echo "Arguments:"
-	   echo "  -f	run in fix mode"
-		 exit 2;;
-   esac
+	case $name in
+	f)	FIX_MODE=1;;
+	?)	printf "Usage: %s: [-f] [TARGETS]\n" "$0"
+		echo "Arguments:"
+		echo "	-f	run in fix mode"
+		exit 2;;
+	esac
 done
 shift $((OPTIND - 1))
-printf "Remaining arguments are: %s\n$*"
+if [[ -n "$*" ]] ; then
+	printf "\nRemaining arguments are: %s\n$*\n\n"
+fi
 
+
+PYTHON=python3
 
 TARGETS=(
 	'pikaur'
@@ -30,32 +35,7 @@ if [[ -n "${1:-}" ]] ; then
 fi
 
 
-script_dir=$(readlink -e "$(dirname "${0}")")
-APP_DIR="$(readlink -e "${script_dir}"/..)"
-
-export PYTHONWARNINGS='ignore,error:::pikaur[.*],error:::pikaur_test[.*]'
-
-echo Python compile...
-"$PYTHON" -O -m compileall "${TARGETS[@]}" \
-| (\
-	grep -v -e '^Listing' -e '^Compiling' || true \
-)
-
-echo Python import...
-#"$PYTHON" -c "import pikaur"
-"$PYTHON" -c "import pikaur.main"
-
-if [[ "$FIX_MODE" -eq 1 ]] ; then
-	"${APP_DIR}/env/bin/ruff" --unsafe-fixes --fix "${TARGETS[@]}"
-else
-
-	echo Checking for non-Final globals...
-	./maintenance_scripts/get_non_final_expressions.sh
-
-	echo Checking for unreasonable global vars...
-	./maintenance_scripts/get_global_expressions.sh
-
-	echo Ruff...
+install_ruff() {
 	if [[ ! -f "${APP_DIR}/env/bin/activate" ]] ; then
 		"$PYTHON" -m venv "${APP_DIR}/env" --system-site-packages
 		# shellcheck disable=SC1091
@@ -63,14 +43,52 @@ else
 		"$PYTHON" -m pip install ruff --upgrade
 		deactivate
 	fi
-	"${APP_DIR}/env/bin/ruff" "${TARGETS[@]}"
+}
+RUFF="${APP_DIR}/env/bin/ruff"
+
+
+if [[ "$FIX_MODE" -eq 1 ]] ; then
+	"$RUFF" check --unsafe-fixes --fix "${TARGETS[@]}"
+else
+	export PYTHONWARNINGS='ignore,error:::pikaur[.*],error:::pikaur_test[.*]'
+
+
+	echo Python compile...
+	"$PYTHON" -O -m compileall "${TARGETS[@]}" \
+	| (\
+		grep -v -e '^Listing' -e '^Compiling' || true \
+	)
+
+	echo Python import...
+	#"$PYTHON" -c "import pikaur"
+	"$PYTHON" -c "import pikaur.main"
+
+	echo Checking for non-Final globals...
+	./maintenance_scripts/get_non_final_expressions.sh
+
+	echo Checking for unreasonable global vars...
+	./maintenance_scripts/get_global_expressions.sh
+
+	install_ruff
+	echo Ruff rules up-to-date...
+	diff --color -u \
+		<(awk '/select = \[/,/]/' pyproject.toml \
+			| sed -e 's|", "|/|g' \
+			| head -n -1 \
+			| tail -n +2 \
+			| tr -d '",#' \
+			| awk '{print $1;}' \
+			| sort) \
+		<("$RUFF" linter \
+			| awk '{print $1;}' \
+			| sort)
+	echo Ruff...
+	"$RUFF" check "${TARGETS[@]}"
 
 	echo Flake8...
-	#"$PYTHON" -m flake8 "${TARGETS[@]}"
+	"$PYTHON" -m flake8 "${TARGETS[@]}"
 
 	echo PyLint...
-	#"$PYTHON" -m pylint --jobs="$(nproc)" "${TARGETS[@]}" --score no
-	# @TODO: --jobs is broken at the moment: https://github.com/PyCQA/pylint/issues/374
 	"$PYTHON" -m pylint "${TARGETS[@]}" --score no
 
 	echo MyPy...
