@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, ClassVar
 import pyalpm
 from pycman.config import PacmanConfig as PycmanConfig
 
-from .args import PACMAN_APPEND_OPTS, PACMAN_STR_OPTS, parse_args, reconstruct_args
+from .args import PACMAN_APPEND_OPTS, get_pacman_str_opts, parse_args, reconstruct_args
 from .config import PikaurConfig
 from .core import DataType, PackageSource, spawn
 from .exceptions import DependencyError, PackagesNotFoundInRepoError
@@ -64,7 +64,9 @@ def create_pacman_pattern(pacman_message: str) -> "Pattern[str]":
     )
 
 
-def get_pacman_command(ignore_args: list[str] | None = None) -> list[str]:
+def get_pacman_command(  # pylint: disable=too-many-branches
+        ignore_args: list[str] | None = None,
+) -> list[str]:
     ignore_args = ignore_args or []
     args = parse_args()
     pacman_path = PikaurConfig().misc.PacmanPath.get_str()
@@ -74,22 +76,34 @@ def get_pacman_command(ignore_args: list[str] | None = None) -> list[str]:
     else:
         pacman_cmd += ["--color=never"]
 
-    for _short, arg, _default, _help in PACMAN_STR_OPTS:
+    for short, long, _default, _help in get_pacman_str_opts():
+        arg = long or short
+        if not arg:
+            continue
         if arg == "color":  # we force it anyway
             continue
         if arg in ignore_args:
             continue
         value = getattr(args, arg)
         if value:
-            pacman_cmd += ["--" + arg, value]
+            if long:
+                pacman_cmd += ["--" + long, value]
+            elif short:
+                pacman_cmd += ["-" + short, value]
 
-    for _short, arg, _default, _help in PACMAN_APPEND_OPTS:
+    for short, long, _default, _help in PACMAN_APPEND_OPTS:
+        arg = long or short
+        if not arg:
+            continue
         if arg == "ignore":  # we reprocess it anyway
             continue
         if arg in ignore_args:
             continue
         for value in getattr(args, arg) or []:
-            pacman_cmd += ["--" + arg, value]
+            if long:
+                pacman_cmd += ["--" + long, value]
+            elif short:
+                pacman_cmd += ["-" + short, value]
 
     return pacman_cmd
 
@@ -340,17 +354,18 @@ class PackageDB(PackageDBCommon):
     def search_repo(
             cls,
             search_query: str,
-            db_name: str | None = None,
+            db_names: list[str] | None = None,
             *,
             names_only: bool = False,
             exact_match: bool = False,
     ) -> list[pyalpm.Package]:
         if REPO_NAME_DELIMITER in search_query:
             db_name, search_query = search_query.split(REPO_NAME_DELIMITER)
+            db_names = [db_name]
         return list(reversed([
             pkg
             for sync_db in reversed(cls.get_alpm_handle().get_syncdbs())
-            if not db_name or db_name == sync_db.name
+            if not db_names or (sync_db.name in db_names)
             for pkg in sync_db.search(search_query)
             if (
                 (

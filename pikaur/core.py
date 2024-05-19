@@ -44,7 +44,7 @@ SYSTEMD_MIN_VERSION: "Final" = 235
 READ_MODE: "Final" = "r"
 
 
-class ComparableType:  # noqa: PLW1641
+class ComparableType:
 
     __ignore_in_eq__: tuple[str, ...] = ()
 
@@ -368,10 +368,10 @@ def check_runtime_deps(dep_names: list[str] | None = None) -> None:
 
     for dep_bin in dep_names:
         if not shutil.which(dep_bin):
-            print_error("'{}' {}.".format(  # pylint: disable=consider-using-f-string
-                bold_line(dep_bin),
-                translate("executable not found"),
-            ))
+            message = translate("executable not found")
+            print_error(
+                f"'{bold_line(dep_bin)}' {message}.",
+            )
             sys.exit(2)
 
 

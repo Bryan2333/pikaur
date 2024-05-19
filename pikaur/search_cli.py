@@ -29,11 +29,13 @@ if TYPE_CHECKING:
     SamePackageTypeT = TypeVar("SamePackageTypeT", AURPackageInfo, pyalpm.Package)
 
 
-def package_search_thread_repo(query: str) -> "list[pyalpm.Package]":
+def package_search_thread_repo(
+        query: str, db_names: list[str] | None = None,
+) -> "list[pyalpm.Package]":
     args = parse_args()
     result = (
-        PackageDB.search_repo(query, names_only=args.namesonly)
-        if query else
+        PackageDB.search_repo(query, names_only=args.namesonly, db_names=db_names)
+        if (query or db_names) else
         PackageDB.get_repo_list(quiet=True)
     )
     if not args.quiet:
@@ -101,7 +103,7 @@ def package_search_thread_aur(  # pylint: disable=too-many-branches
                     pkg for pkg in subresult
                     if subindex in pkg.name
                 ]
-    elif args.quiet:
+    elif args.quiet or args.list:
         result = {"all": [
             AURPackageInfo(
                 name=name,
@@ -146,15 +148,30 @@ def join_search_results(
     }.values()
 
 
-def search_packages(
+def search_packages(  # noqa: PLR0914
         *, enumerated: bool = False,
 ) -> "list[AnyPackage]":
     refresh_pkg_db_if_needed()
 
     args = parse_args()
-    search_query = args.positional or []
-    repo_only = args.repo
-    aur_only = args.aur
+    search_query = ((not args.list) and args.positional) or []
+    repo_query = (args.list and args.positional) or None
+    repo_only = (
+        args.repo
+        or (
+            args.list
+            and args.positional
+            and ("aur" not in args.positional)
+        )
+    )
+    aur_only = (
+        args.aur
+        or (
+            args.list
+            and (len(args.positional) == 1)
+            and (args.positional[0] == "aur")
+        )
+    )
 
     if not args.quiet:
         progressbar_length = max(len(search_query), 1) + (not repo_only) + (not aur_only)
@@ -164,7 +181,7 @@ def search_packages(
     with ThreadPool() as pool:
         request_local = pool.apply_async(package_search_thread_local, ())
         requests_repo = [
-            pool.apply_async(package_search_thread_repo, (search_word, ))
+            pool.apply_async(package_search_thread_repo, (search_word, repo_query))
             for search_word in (search_query or [""])
         ] if not aur_only else []
         request_aur = pool.apply_async(
@@ -183,7 +200,8 @@ def search_packages(
             try:
                 result_aur = request_aur.get()
             except AURError as exc:
-                print_stderr(f"{translate('AUR returned error:')} {exc}")
+                message = translate("AUR returned error:")
+                print_stderr(f"{message} {exc}")
                 raise SysExit(121) from exc
         pool.join()
 
@@ -200,6 +218,7 @@ def search_packages(
         aur_packages=joined_aur_results,
         local_pkgs_versions=result_local,
         enumerated=enumerated,
+        list_mode=bool(args.list),
     )
 
 

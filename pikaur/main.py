@@ -201,7 +201,7 @@ def cli_dynamic_select() -> None:  # pragma: no cover
             for idx in selected_pkgs_idx:
                 if not 0 <= idx < len(packages):
                     print_error(translate("invalid value: {} is not between {} and {}").format(
-                        idx + 1, 1, len(packages) + 1,
+                        idx + 1, 1, len(packages),
                     ))
                     restart_prompt = True
             if restart_prompt:
@@ -298,7 +298,7 @@ def cli_entry_point() -> None:  # pylint: disable=too-many-statements
         pikaur_operation = cli_pkgbuild
 
     elif args.sync:
-        if args.search:
+        if args.search or args.list:
             pikaur_operation = cli_search_packages
         elif args.info:
             pikaur_operation = cli_info_packages
@@ -306,15 +306,15 @@ def cli_entry_point() -> None:  # pylint: disable=too-many-statements
             if not args.aur:
                 require_sudo = True
             pikaur_operation = cli_clean_packages_cache
-        elif args.groups or args.list:   # @TODO: implement -l/--list
+        elif args.groups:
             require_sudo = False
         else:
             require_sudo = True
             pikaur_operation = cli_install_packages
 
-    elif not (args.database or args.remove or args.deptest or args.upgrade):
-        if args.positional:
-            pikaur_operation = cli_dynamic_select
+    elif args.interactive_package_select:
+        require_sudo = True
+        pikaur_operation = cli_dynamic_select
 
     else:
         require_sudo = True
@@ -415,9 +415,10 @@ def main(*, embed: bool = False) -> None:
             sys.exit(22)
         check_runtime_deps()
 
-        create_dirs()
         # initialize config to avoid race condition in threads:
         PikaurConfig.get_config()
+
+        create_dirs()
 
         atexit.register(restore_tty)
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)

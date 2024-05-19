@@ -87,6 +87,15 @@ class InstallTest(PikaurDbTestCase):
         pikaur("-P --noconfirm --install")
         self.assertInstalled(pkg_name)
 
+    def test_pkgbuild_runtime_deps(self):
+        pkg_name = "samplepkg_runtime_deps"
+        result = pikaur(
+            "-P ./pikaur_test/PKGBUILD_runtime_deps",
+            capture_stderr=True,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertNotInstalled(pkg_name)
+
     def test_pkgbuild_split_packages(self):
         # pkg_base = "lua-xmlrpc"
         pkg_name1 = "lua51-xmlrpc"
@@ -145,23 +154,23 @@ class InstallTest(PikaurDbTestCase):
         self.assertNotInstalled(conflicting_aur_package2)
 
     def test_conflicting_aur_and_repo_packages(self):
-        self.remove_if_installed("pacaur", "expac-git", "expac")
+        self.remove_if_installed("abduco", "abduco-git")
         self.assertEqual(
-            pikaur("-S expac-git expac").returncode, 131,
+            pikaur("-S abduco-git abduco").returncode, 131,
         )
-        self.assertNotInstalled("expac")
-        self.assertNotInstalled("expac-git")
+        self.assertNotInstalled("abduco")
+        self.assertNotInstalled("abduco-git")
 
     def test_conflicting_aur_and_installed_repo_packages(self):
-        self.remove_if_installed("pacaur", "expac-git", "expac")
+        self.remove_if_installed("abduco", "abduco-git")
         self.assertEqual(
-            pikaur("-S expac").returncode, 0,
+            pikaur("-S abduco").returncode, 0,
         )
         self.assertEqual(
-            pikaur("-S expac-git").returncode, 131,
+            pikaur("-S abduco-git").returncode, 131,
         )
-        self.assertInstalled("expac")
-        self.assertNotInstalled("expac-git")
+        self.assertInstalled("abduco")
+        self.assertNotInstalled("abduco-git")
 
     def test_cache_clean(self):
         # pylint:disable=import-outside-toplevel
