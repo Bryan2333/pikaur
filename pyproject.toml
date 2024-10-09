@@ -1,11 +1,11 @@
 [project]
 name = "pikaur"
-version = '1.20'
+version = '1.30.2'
 description = 'AUR helper with minimal dependencies'
 authors = [
   {name = 'Yauheni Kirylau', email = 'actionless.loveless@gmail.com'},
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 classifiers = [
   'Development Status :: 5 - Production/Stable',
   'Environment :: Console',
@@ -33,6 +33,7 @@ repository = 'https://github.com/actionless/pikaur'
 
 [project.scripts]
 pikaur = "pikaur.main:main"
+pikasay = "pikaur.pikasay:pikasay_cli"
 
 [tool.setuptools.packages.find]
 include = ["pikaur"]
@@ -42,7 +43,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.bandit]
-exclude_dirs = ["./dumpster/", "./maintenance_scripts/"]
+exclude_dirs = ["./dumpster/", "./maintenance_scripts/", "./pikaur_meta_helpers/"]
 
 [tool.mypy]
 check_untyped_defs = true
@@ -66,6 +67,7 @@ mypy_path = './maintenance_scripts/mypy_stubs'
 
 [tool.ruff]
 line-length = 100
+unsafe-fixes = true
 
 [tool.ruff.lint.mccabe]
 max-complexity = 19
@@ -82,11 +84,11 @@ select = [
   "I",
   "N",
   "D",
+  #"DOC", pydoclint
   "UP",
   "YTT",
   "ANN",
   "ASYNC",
-  "TRIO",
   "S",
   "BLE",
   "FBT",
@@ -98,6 +100,7 @@ select = [
   "DTZ",
   "T10",
   #"DJ",  # django
+  #"FAST",  # fastapi
   "EM",
   "EXE",
   "FA",
@@ -138,10 +141,16 @@ select = [
 ignore = [
   # enable back later:
   "ERA001", # commented out code
+
   # already managed by pylint, mb replace completely to ruff later:
-  "PLR0912",  # too many branches
-  "PLR0913",  # too many arguments
-  "PLR0915",  # too many statements
+  "PLR0904",  # too-many-public-methods
+  "PLR0911",  # too-many-return-statements
+  "PLR0912",  # too-many-branches
+  "PLR0913",  # too-many-arguments
+  "PLR0914",  # too-many-locals
+  "PLR0915",  # too-many-statements
+  "PLR0917",  # too-many-positional-arguments
+  "PLR1702",  # too-many-nested-blocks
 
   "PLE1205",  # pikaur is using non-default `logging`
 
@@ -172,7 +181,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"pikaur/argparse.py" = [
+"pikaur/argparse_extras.py" = [
   "PLR0912",
   "PLR0915",
   "SLF001",
@@ -197,6 +206,14 @@ ignore = [
   "T201",
   "T203",
 ]
+"pikaur_meta_helpers/*.py" = [
+  "INP001",
+  "S301",
+  "S403",
+  "S404",
+  "T201",
+  "T203",
+]
 "maintenance_scripts/pikaman.py" = [
   "ARG002",
   "PLR6301",
@@ -209,6 +226,19 @@ ignore = [
 "packaging/usr/bin/pikaur" = [
   "T201",
 ]
+"pypyalpm.py" = [
+  "T201",
+  "PTH107",
+  "PTH112",
+  "PTH118",
+]
+"pacman_fallback.py" = [
+  "T201",
+  "PTH107",
+  "PTH112",
+  "PTH118",
+]
+
 
 [tool.pylint.MASTER]
 jobs = '0'
@@ -309,10 +339,10 @@ max-bool-expr = '6'
 max-branches = '12'
 max-locals = '15'
 max-parents = '7'
+min-public-methods = '2'
 max-public-methods = '20'
 max-returns = '6'
 max-statements = '50'
-min-public-methods = '2'
 
 [tool.pylint.EXCEPTIONS]
 overgeneral-exceptions = ''

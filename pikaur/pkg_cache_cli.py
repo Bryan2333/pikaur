@@ -1,13 +1,14 @@
 from .args import parse_args, reconstruct_args
-from .config import BuildCachePath, PackageCachePath, PikaurConfig
-from .core import interactive_spawn, remove_dir
+from .config import DECORATION, BuildCachePath, PackageCachePath
 from .exceptions import SysExit
 from .i18n import translate
-from .logging import create_logger
+from .logging_extras import create_logger
+from .os_utils import remove_dir
+from .pikaprint import ColorsHighlight, bold_line, color_line, print_stdout
 from .pikspect import YesNo, format_pacman_question, pikspect
-from .pprint import ColorsHighlight, bold_line, color_line, print_stdout
 from .privilege import sudo
 from .prompt import ask_to_continue
+from .spawn import interactive_spawn
 
 _debug = create_logger("pkg_cache_cli").debug
 
@@ -15,8 +16,8 @@ _debug = create_logger("pkg_cache_cli").debug
 def clean_aur_cache() -> None:
     args = parse_args()
     for directory, message, minimal_clean_level in (
-            (BuildCachePath()(), translate("Build directory"), 1),
-            (PackageCachePath()(), translate("Packages directory"), 2),
+            (BuildCachePath(), translate("Build directory"), 1),
+            (PackageCachePath(), translate("Packages directory"), 2),
     ):
         print_stdout(f"\n{message}: {directory}")
         question = translate("Do you want to remove all files?")
@@ -26,7 +27,7 @@ def clean_aur_cache() -> None:
             print_stdout(translate("Directory is empty."))
         elif ask_to_continue(
             text=(
-                f"{color_line('::', ColorsHighlight.blue)}"
+                f"{color_line(DECORATION, ColorsHighlight.blue)}"
                 f" {bold_line(question)}"
             ),
         ):
@@ -40,7 +41,7 @@ def clean_repo_cache() -> None:
     if args.noconfirm:
         returncode = pikspect(
             sudo([
-                PikaurConfig().misc.PacmanPath.get_str(),
+                args.pacman_path,
                 *reconstruct_args(args, ignore_args=["noconfirm"]),
             ]),
             extra_questions={YesNo.ANSWER_Y: [
@@ -60,7 +61,7 @@ def clean_repo_cache() -> None:
             returncode = 255
     else:
         returncode = interactive_spawn(sudo([
-            PikaurConfig().misc.PacmanPath.get_str(),
+            args.pacman_path,
             *reconstruct_args(args, ignore_args=["noconfirm"]),
         ])).returncode
     raise SysExit(returncode)

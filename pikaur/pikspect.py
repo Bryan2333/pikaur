@@ -1,12 +1,10 @@
 """Licensed under GPLv3, see https://www.gnu.org/licenses/"""
 
-import fcntl
 import os
 import re
 import select
 import shutil
 import signal
-import struct
 import sys
 import termios
 import tty
@@ -21,14 +19,15 @@ from pty import (  # type: ignore[attr-defined]
     fork,
 )
 from tty import setraw, tcgetattr, tcsetattr  # type: ignore[attr-defined]
+from types import FrameType
 from typing import TYPE_CHECKING
 
 from .args import parse_args
-from .core import DEFAULT_INPUT_ENCODING
+from .config import DEFAULT_INPUT_ENCODING
 from .i18n import translate
-from .logging import create_logger
+from .logging_extras import create_logger
 from .pacman_i18n import _p
-from .pprint import (
+from .pikaprint import (
     ColorsHighlight,
     PrintLock,
     TTYRestore,
@@ -55,11 +54,11 @@ StdinReaderType = Callable[[int | None], bytes]
 FILE_DEBUG: "Final" = False
 
 
-def file_debug(message: "Any") -> None:
-    # @TODO: move it to the logging module
+def file_debug(*messages: "Any") -> None:
+    # @TODO: move it to the logging_extras module
     if FILE_DEBUG:
         with Path("./pikspect_debug.txt").open("a", encoding=DEFAULT_INPUT_ENCODING) as fobj:
-            fobj.write(str(message) + "\n")
+            fobj.write(" ".join(str(message) for message in messages) + "\n")
 
 
 def _copy(  # pylint: disable=too-many-branches
@@ -67,7 +66,11 @@ def _copy(  # pylint: disable=too-many-branches
         master_read: MasterReaderType = _read,
         stdin_read: StdinReaderType = _read,
 ) -> None:
-    """Fork of pty._copy from python's stdlib."""
+    """
+    Fork of pty._copy from python's stdlib.
+    It calls stdin_read even if real stdin is not ready,
+    giving the opportunity to inject pre-programmed input there.
+    """
     if os.get_blocking(master_fd):
         # If we write more than tty/ndisc is willing to buffer, we may block
         # indefinitely. So we set master_fd to non-blocking temporarily during
@@ -126,6 +129,7 @@ def _copy(  # pylint: disable=too-many-branches
                 stdin_avail = False
             else:
                 i_buf += data
+        # ---- added: ----
         else:
             data = stdin_read(None)
             if data:
@@ -136,18 +140,19 @@ def _copy(  # pylint: disable=too-many-branches
 
 def spawn(
         argv: list[str] | str,
+        env: dict[str, str],
         master_read: MasterReaderType = _read,
         stdin_read: StdinReaderType = _read,
         after_fork: Callable[[int, int], None] | None = None,
 ) -> int:
-    """Fork of pty.spawn to add support for `after_fork` callback."""
+    """Fork of pty.spawn to add support for `env` and `after_fork` callback."""
     if isinstance(argv, str):
         argv = [argv]
     # sys.audit('pty.spawn', argv)
 
     pid, master_fd = fork()
     if pid == CHILD:
-        os.execlp(argv[0], *argv)  # nosec B606  # noqa: S606
+        os.execlpe(argv[0], *argv, env)  # nosec B606  # noqa: S606
 
     try:
         mode = tcgetattr(STDIN_FILENO)
@@ -177,11 +182,12 @@ class ReadlineKeycodes:
     BACKSPACE: "Final" = 127
 
 
+def get_terminal_geometry(rows: int = 80, columns: int = 80) -> os.terminal_size:
+    return shutil.get_terminal_size((rows, columns))
+
+
 def set_terminal_geometry(file_descriptor: int, rows: int, columns: int) -> None:
-    term_geometry_struct = struct.pack("HHHH", rows, columns, 0, 0)
-    fcntl.ioctl(
-        file_descriptor, termios.TIOCSWINSZ, term_geometry_struct,
-    )
+    termios.tcsetwinsize(file_descriptor, (rows, columns))
 
 
 class TTYInputWrapper:  # pragma: no cover
@@ -196,7 +202,7 @@ class TTYInputWrapper:  # pragma: no cover
             self.old_stdin = sys.stdin
             try:
                 logger.debug("Attaching to TTY manually...")
-                sys.stdin = Path("/dev/tty").open(encoding=DEFAULT_INPUT_ENCODING)  # noqa: SIM115
+                sys.stdin = Path("/dev/tty").open(encoding=DEFAULT_INPUT_ENCODING)
                 self.tty_opened = True
             except Exception as exc:
                 logger.debug(exc)
@@ -210,13 +216,18 @@ class TTYInputWrapper:  # pragma: no cover
 
 class NestedTerminal:
 
-    def __init__(self) -> None:
+    _original_signal: "signal.Handlers | Callable[[int, FrameType | None], Any] | int | None" = None
+
+    def __init__(
+            self, on_terminal_resize: Callable[[int, FrameType | None], None] | None = None,
+    ) -> None:
         self.tty_wrapper = TTYInputWrapper()
+        self.on_terminal_resize = on_terminal_resize
 
     def __enter__(self) -> os.terminal_size:
         logger.debug("Opening virtual terminal...")
         self.tty_wrapper.__enter__()
-        real_term_geometry = shutil.get_terminal_size((80, 80))
+        real_term_geometry = get_terminal_geometry()
         for stream in (
                 sys.stdin,
                 sys.stderr,
@@ -224,9 +235,14 @@ class NestedTerminal:
         ):
             if stream.isatty():
                 tty.setcbreak(stream.fileno())
+        if self.on_terminal_resize is not None:
+            self._original_signal = signal.getsignal(signal.SIGWINCH)
+            signal.signal(signal.SIGWINCH, self.on_terminal_resize)
         return real_term_geometry
 
     def __exit__(self, *exc_details: object) -> None:
+        if self._original_signal is not None:
+            signal.signal(signal.SIGWINCH, self._original_signal)
         self.tty_wrapper.__exit__(*exc_details)
         TTYRestore.restore()
 
@@ -277,6 +293,7 @@ class PikspectPopen:
 
     capture_output: bool
     output: bytes
+    output_file_descriptor: int | None = None
 
     def __enter__(self) -> "PikspectPopen":
         return self
@@ -314,16 +331,31 @@ class PikspectPopen:
         if self.pid:
             os.kill(self.pid, sig)
 
-    def _pty_init(self, file_descriptor: int, pid: int) -> None:
-        # @TODO: add support for sigwinch later
-        logger.debug("fd: {}, pid: {}", file_descriptor, pid)
-        if self.real_term_geometry:
+    def apply_current_size_to_sub_terminal(self, file_descriptor: int) -> None:
+        if self.real_term_geometry is not None:
             set_terminal_geometry(
                 file_descriptor,
                 columns=self.real_term_geometry.columns,
                 rows=self.real_term_geometry.lines,
             )
+            self.send_signal(signal.SIGWINCH)
+
+    def resize_sub_terminal_if_needed(self, file_descriptor: int) -> None:
+        current_real_term_geometry = get_terminal_geometry()
+        if self.real_term_geometry != current_real_term_geometry:
+            self.real_term_geometry = current_real_term_geometry
+            file_debug("resizing sub-terminal: ", file_descriptor, current_real_term_geometry)
+            self.apply_current_size_to_sub_terminal(file_descriptor)
+
+    def _pty_init(self, file_descriptor: int, pid: int) -> None:
+        logger.debug("fd: {}, pid: {}", file_descriptor, pid)
+        self.output_file_descriptor = file_descriptor
         self.pid = pid
+        self.apply_current_size_to_sub_terminal(file_descriptor)
+
+    def _on_terminal_resize(self, _signum: int, _frame: FrameType | None = None) -> None:
+        if self.output_file_descriptor:
+            self.resize_sub_terminal_if_needed(self.output_file_descriptor)
 
     def run(self) -> None:
         if not isinstance(self.args, list):
@@ -335,10 +367,12 @@ class PikspectPopen:
             lambda *_whatever: self.send_signal(signal.SIGINT),
         )
         try:
-            with NestedTerminal() as real_term_geometry:
+            with NestedTerminal(on_terminal_resize=self._on_terminal_resize) as real_term_geometry:
                 self.real_term_geometry = real_term_geometry
+                env = os.environ.copy()
                 result = spawn(
-                    self.args,
+                    argv=self.args,
+                    env=env,
                     master_read=self.cmd_output_reader,
                     stdin_read=self.user_input_reader,
                     after_fork=self._pty_init,
@@ -364,9 +398,11 @@ class PikspectPopen:
 
         for answer, questions in self.default_questions.items():
             for question in questions:
+                file_debug("question", question)
                 if not _match(question, historic_output):
                     continue
                 logger.debug("Found right answer to `{}`: `{}`", question, answer)
+                file_debug("Found right answer to `{}`: `{}`", question, answer)
                 self.next_answers.append(answer)
                 clear_buffer = True
                 break
@@ -375,12 +411,6 @@ class PikspectPopen:
             self.historic_output = [b""]
 
     def cmd_output_reader(self, file_descriptor: int) -> bytes:
-        if self.real_term_geometry:
-            set_terminal_geometry(
-                file_descriptor,
-                columns=self.real_term_geometry.columns,
-                rows=self.real_term_geometry.lines,
-            )
         output = os.read(file_descriptor, 4096)
         if self.capture_output:
             self.output += output
@@ -392,12 +422,8 @@ class PikspectPopen:
         return output
 
     def user_input_reader(self, file_descriptor: int | None = None) -> bytes:  # pragma: no cover
-        if file_descriptor and self.real_term_geometry:
-            set_terminal_geometry(
-                file_descriptor,
-                columns=self.real_term_geometry.columns,
-                rows=self.real_term_geometry.lines,
-            )
+        if file_descriptor:
+            self.resize_sub_terminal_if_needed(file_descriptor)
         file_debug(f"UserInputReader {file_descriptor}:")
         if self.next_answers:
             char = ("\n".join(self.next_answers) + "\n").encode(DEFAULT_INPUT_ENCODING)
@@ -454,23 +480,27 @@ def pikspect(
         format_pacman_question("Do you want to remove these packages?"),
     ]
     questions_conflict = format_pacman_question(
-        "%s and %s are in conflict. Remove %s?", YesNo.QUESTION_YN_NO,
+        "%s-%s%s%s and %s-%s%s%s are in conflict. Remove %s?", YesNo.QUESTION_YN_NO,
     )
     questions_conflict_via_provided = format_pacman_question(
-        "%s and %s are in conflict (%s). Remove %s?", YesNo.QUESTION_YN_NO,
+        "%s-%s%s%s and %s-%s%s%s are in conflict (%s). Remove %s?", YesNo.QUESTION_YN_NO,
     )
 
     def format_conflicts(conflicts: list[list[str]]) -> list[str]:
         return [
-            questions_conflict % (new_pkg, old_pkg, old_pkg)
-            for new_pkg, old_pkg in conflicts
-        ] + [
-            (
-                re.escape(questions_conflict_via_provided % (
-                    new_pkg, old_pkg, ".*", old_pkg,
-                ))
-            ).replace(r"\.\*", ".*")
-            for new_pkg, old_pkg in conflicts
+            re.escape(question).replace(r"\.\*", ".*")
+            for question in
+            [
+                questions_conflict % (
+                    f".* {new_pkg}", ".*", "", "", old_pkg, ".*", "", "", old_pkg,
+                )
+                for new_pkg, old_pkg in conflicts
+            ] + [
+                questions_conflict_via_provided % (
+                    f".* {new_pkg}", ".*", "", "", old_pkg, ".*", "", "", ".*", old_pkg,
+                )
+                for new_pkg, old_pkg in conflicts
+            ]
         ]
 
     default_questions: dict[str, list[str]] = {}

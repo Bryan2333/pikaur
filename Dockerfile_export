@@ -3,14 +3,14 @@
 FROM archlinux:base-devel
 WORKDIR /opt/app-build/
 
-RUN echo 'Server = https://mirrors.xtom.nl/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist ; \
+RUN echo 'Server = https://mirrors.xtom.nl/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist ; \
 	echo 'Server = https://archlinux.mirror.pcextreme.nl/$repo/os/$arch' >> /etc/pacman.d/mirrorlist ; \
 	echo 'Server = https://archlinux.mirror.wearetriple.com/$repo/os/$arch' >> /etc/pacman.d/mirrorlist ; \
 	echo 'Server = https://mirror.mijn.host/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist ; \
 	\
 	echo '[multilib]' >> /etc/pacman.conf ; \
 	echo 'Include = /etc/pacman.d/mirrorlist' >> /etc/pacman.conf
-RUN echo "last updated on 2024-04-28" && \
+RUN echo "last updated on 2024-05-25" && \
 	pacman -Syu --noconfirm --needed sudo base-devel git && \
 	useradd -m user && \
 	echo "root ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
@@ -25,8 +25,7 @@ ENV LANG=en_US.utf8 \
 RUN echo ">>>> Installing opt and test deps:" && \
 	pacman -Sy --noconfirm --needed --color=always \
 		devtools python-pysocks python-defusedxml \
-		iputils python-virtualenv \
-		flake8 python-pylint mypy vulture bandit shellcheck && \
+		ruff flake8 python-pylint mypy vulture bandit shellcheck && \
 	echo ">>>> Preparing build directory:" && \
 	chown -R user /opt/app-build/
 
@@ -34,13 +33,17 @@ ADD "https://api.github.com/repos/actionless/pikaur/commits?per_page=1" /home/us
 RUN git clone https://github.com/actionless/pikaur.git /opt/app-build/
 
 RUN	echo ">>>> Starting the build:" && \
+	./maintenance_scripts/changelog.sh > CHANGELOG && \
 	sudo -u user makepkg -fsi --noconfirm && \
-	rm -fr ./src/ ./pkg/
-#RUN sudo -u user python -u maintenance_scripts/pidowngrade.py python-coverage '7.4.1-1'  # up to 7.4.4
-#RUN echo ">>>> Installing test deps using Pikaur itself:" && \
-#    sudo -u user pikaur -S --noconfirm --mflags=--skippgpcheck --color=always python-coveralls
-# Workaround for broken coveralls:
-ADD ./maintenance_scripts/coveralls_PKGBUILD ./coveralls_PKGBUILD
-RUN sudo -u user pikaur -Pi --noconfirm --color=always coveralls_PKGBUILD
+	rm -fr /opt/app-build/pikaur
+
+# Workaround for broken coveralls v1:
+#COPY ./pikaur_meta_helpers /opt/app-build/pikaur_meta_helpers
+#RUN sudo -u user python -um pikaur_meta_helpers.pidowngrade python-coverage '7.4.1-1'  # up to 7.4.4
+# Workaround for broken coveralls v2:
+#ADD ./maintenance_scripts/coveralls_PKGBUILD ./coveralls_PKGBUILD
+#RUN sudo -u user pikaur -Pi --noconfirm --color=always coveralls_PKGBUILD
+RUN echo ">>>> Installing test deps using Pikaur itself:" && \
+	sudo -u user pikaur -S --noconfirm --mflags=--skippgpcheck --color=always python-coveralls
 
 # vim: set ft=dockerfile :

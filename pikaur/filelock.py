@@ -3,8 +3,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .core import DEFAULT_INPUT_ENCODING
-from .logging import create_logger
+from .config import DEFAULT_INPUT_ENCODING
+from .logging_extras import create_logger
 
 if TYPE_CHECKING:
     from typing import Final, TextIO

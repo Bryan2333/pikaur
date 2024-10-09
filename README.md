@@ -31,13 +31,14 @@ The following pacman operations are extended with AUR capabilities:
 * `-Sc` / `-Scc` (build dir/built packages cache clean)
 * `-Qu` (query upgradeable, `-q` supported)
 
-Also see `pikaur -Sh`, `-Qh`, `-Ph` and `-Gh` for pikaur-specific flags.
+Also see `pikaur -Sh`, `-Qh`, `-Ph`, `-Gh` and `-Xh` for pikaur-specific flags.
 
 Pikaur wraps all the pacman options accurately except for `-Syu` which is being split into `-Sy` (to refresh package list first) and `-Su` (to install upgrades after user confirmed the package list or altered it via [M]anual package selection).
 
 
 * [Installation](#installation "")
 * [Run without installation](#run-without-installation "")
+* - [Pikaur-Static](#pikaur-static "")
 * [File locations](#file-locations "")
 * [Config file](#configuration "")
 * [FAQ](#faq "")
@@ -62,7 +63,17 @@ makepkg -fsri
 ![Screenshot](https://raw.githubusercontent.com/actionless/pikaur/master/screenshots/package_update.png "Screenshot")
 
 
+
 ## Run without installation
+
+### Pikaur-Static
+
+To avoid situations during upgrading the system when you can't run Pikaur anymore (for example due breaking changes in Python, Pyalpm or other system dep) it's recommended to have [pikaur-static ⚡️](https://aur.archlinux.org/packages?O=0&SeB=nd&K=pikaur-static&outdated=&SB=p&SO=d&PP=50&submit=Go) installed, which doesn't depend on Python (or Pyalpm) and doesn't conflict with the regular pikaur installation.
+
+You can download it from the [Releases Page](https://github.com/actionless/pikaur/releases)
+(or downgrade Python/[other pkg which broke the update] to the previous version if it broke due to update, build+install `pikaur-static` from aur, upgrade python/[that pkg] again).
+
+### Running directly from git repo for development purposes/etc
 
 ```sh
 git clone https://github.com/actionless/pikaur.git
@@ -200,11 +211,15 @@ Reverse search results of the commands like `pikaur -Ss <query>` or `pikaur <que
 ##### WarnAboutPackageUpdates (default: )
 Comma-separated list of packages names or globs, which upgrade should have additional warning message in the UI.
 
+##### WarnAboutNonDefaultPrivilegeEscalationTool (default: yes)
+Print warning when using privilege escalation tool other than `sudo`.
+
 
 #### [misc]
 
 ##### PacmanPath (default: pacman)
 Path to pacman executable.
+Will be overriden by `--pacman-path` flag.
 
 ##### PreserveEnv (default: `PKGDEST,VISUAL,EDITOR,http_proxy,https_proxy,ftp_proxy,HTTP_PROXY,HTTPS_PROXY,FTP_PROXY,ALL_PROXY`)
 Preserve environment variables of current user when running pikaur as root (comma-separated).
@@ -238,7 +253,7 @@ or environment variable `XDG_DATA_HOME`, if set.
 ##### AurUrl (default: https://aur.archlinux.org)
 AUR Host.
 
-##### NewsUrl (default: https://www.archlinux.org/feeds/news/)
+##### NewsUrl (default: https://archlinux.org/feeds/news/)
 Arch Linux News URL, useful for users of Parabola or other Arch derivatives.
 
 ##### Socks5Proxy (default: )
@@ -370,12 +385,18 @@ gpg --batch --passphrase '' --quick-gen-key "pikaur@localhost" rsa sign 0
 
 You can start from [this list of issues](https://github.com/actionless/pikaur/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22 ""). Grep-ing `@TODO` comments also useful if you're itching to write something.
 
+To install development deps, run:
+
+```sh
+pikaur -Pi ./PKGBUILD_dev_deps
+```
+
 #### Running CI locally
 
 ##### Linters (code quality check)
 
 ```sh
-./maintenance_scripts/lint.sh
+make -j lint
 ```
 
 ##### Tests
@@ -386,13 +407,19 @@ You can start from [this list of issues](https://github.com/actionless/pikaur/is
 
 See also `./maintenance_scripts/docker_test.sh --help` for more options.
 
+For example to run a single test inside docker:
+
+```sh
+./maintenance_scripts/docker_test.sh --local 1 pikaur_test.test_sysupgrade.SysupgradeTest.test_devel_upgrade
+```
+
 
 ### Translations
 
-To start working on a new language, say `hi_IN` (Indian Hindi), add it to the
-`Makefile` `LANGS` variable and run `make`. Then translate `locale/hi_IN.po` using
-your favorite PO editor. Run `make` every time the Python code strings change
-or the `.po` is modified.
+To start working on a new language, say `hi_IN` (Indian Hindi):
+1) add it to the `Makefile` `LANGS` variable and run `make`.
+2) Then translate `locale/hi_IN.po` using your favorite PO editor (for example `gtranslator`).
+3) Run `make` every time the Python code strings change or the `.po` is modified.
 
 
 

@@ -9,16 +9,22 @@ try:
 except ModuleNotFoundError:
     from xml.etree.ElementTree import fromstring  # nosec B405  # noqa: S405
 
-from .config import CacheRoot, PikaurConfig
-from .core import DEFAULT_TIMEZONE, open_file
+from .config import DEFAULT_TIMEZONE, CacheRoot, PikaurConfig
 from .i18n import translate
-from .logging import create_logger
+from .logging_extras import create_logger
+from .os_utils import open_file
 from .pacman import PackageDB
-from .pprint import (
+from .pikaprint import (
+    BOLD_RESET,
+    BOLD_START,
+    COLOR_RESET,
+    PADDING,
     ColorsHighlight,
     bold_line,
     color_line,
+    color_start,
     format_paragraph,
+    get_term_width,
     print_error,
     print_stdout,
 )
@@ -50,7 +56,7 @@ class News:
 
     def __init__(self) -> None:
         self.url = PikaurConfig().network.NewsUrl.get_str()
-        self.cache_file = CacheRoot()() / "last_seen_news.dat"
+        self.cache_file = CacheRoot() / "last_seen_news.dat"
         self._news_feed = None
         self._news_entry_to_update_last_seen_date = None
         logger.debug("init")
@@ -145,6 +151,7 @@ class News:
     @staticmethod
     def _print_one_entry(news_entry: "Element") -> None:
         child: Element
+        title = pub_date = description = ""
         for child in news_entry:
             if ArchNewsMarkup.TITLE in child.tag:
                 title = str(child.text)
@@ -157,7 +164,7 @@ class News:
             " (" + bold_line(pub_date) + ")",
         )
         print_stdout(
-            format_paragraph(strip_tags(description)),
+            "\n".join(format_paragraph(line) for line in strip_tags(description).splitlines()),
         )
         print_stdout()
 
@@ -175,7 +182,10 @@ class News:
 
 
 class MLStripper(HTMLParser):
-    """HTMLParser that only removes HTML statements."""
+    """HTMLParser optimized for terminal output."""
+
+    last_href: str | None = None
+    last_data: str | None = None
 
     def error(self, message: object) -> None:
         pass
@@ -187,7 +197,47 @@ class MLStripper(HTMLParser):
         self.convert_charrefs = True
         self.fed: list[str] = []
 
+    def handle_starttag(
+            self, tag: str, attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag in {"strong", "em"}:
+            self.fed.append(BOLD_START)
+        elif tag == "h2":
+            self.fed.append("\n")
+        elif tag == "hr":
+            self.fed.append("-" * (get_term_width() - PADDING * 2))
+        elif tag == "a":
+            self.last_href = dict(attrs).get("href")
+        elif tag == "li":
+            self.fed.append("- ")
+
+        color = None
+        if tag == "code":
+            color = ColorsHighlight.green
+        elif tag == "blockquote":
+            color = ColorsHighlight.yellow
+        elif tag == "a":
+            color = ColorsHighlight.cyan
+        elif tag == "h2":
+            color = ColorsHighlight.purple
+        elif tag not in {"strong", "em", "h2", "hr", "li", "ul", "p"}:
+            logger.debug("Encountered unknown start tag: {}", tag)
+        if color is not None:
+            self.fed.append(color_start(color))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"code", "blockquote", "a", "h2"}:
+            self.fed.append(COLOR_RESET)
+        elif tag in {"strong", "em"}:
+            self.fed.append(BOLD_RESET)
+        if (tag == "a") and self.last_href:
+            if self.last_data != self.last_href:
+                self.fed.append(f": {color_line(self.last_href, ColorsHighlight.blue)} ")
+            else:
+                self.fed.append(" ")
+
     def handle_data(self, data: str) -> None:
+        self.last_data = data
         self.fed.append(data)
 
     def get_data(self) -> str:

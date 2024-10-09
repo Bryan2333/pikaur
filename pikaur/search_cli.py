@@ -6,16 +6,16 @@ from typing import TYPE_CHECKING
 
 from .args import parse_args
 from .aur import (
-    AURPackageInfo,
     AurRPCErrors,
-    aur_rpc_search_name_desc,
+    aur_rpc_search,
     get_all_aur_names,
     get_all_aur_packages,
 )
 from .exceptions import AURError, SysExit
 from .i18n import translate
 from .pacman import PackageDB, get_pkg_id, refresh_pkg_db_if_needed
-from .pprint import print_error, print_stderr
+from .pikaprint import print_error, print_stderr
+from .pikatypes import AURPackageInfo
 from .print_department import print_package_search_results
 
 if TYPE_CHECKING:
@@ -29,37 +29,44 @@ if TYPE_CHECKING:
     SamePackageTypeT = TypeVar("SamePackageTypeT", AURPackageInfo, pyalpm.Package)
 
 
-def package_search_thread_repo(
-        query: str, db_names: list[str] | None = None,
-) -> "list[pyalpm.Package]":
-    args = parse_args()
-    result = (
-        PackageDB.search_repo(query, names_only=args.namesonly, db_names=db_names)
-        if (query or db_names) else
-        PackageDB.get_repo_list(quiet=True)
-    )
-    if not args.quiet:
-        sys.stderr.write("#")
-    return result
-
-
-def filter_aur_results(
-        results: dict[str, list[AURPackageInfo]],
+def filter_search_results(
+        results: "dict[str, list[SamePackageTypeT]]",
         query: str,
         *,
         names_only: bool = False,
-) -> dict[str, list[AURPackageInfo]]:
-    filtered_results: dict[str, list[AURPackageInfo]] = {}
+) -> "dict[str, list[SamePackageTypeT]]":
+    filtered_results: dict[str, list[SamePackageTypeT]] = {}
     for _q, pkgs in results.items():
         for pkg in pkgs:
             if (
                     query in pkg.name
             ) or (
-                not names_only and
-                (query in (pkg.desc or ""))
+                not names_only
+                and pkg.desc
+                and (query in pkg.desc)
             ):
                 filtered_results.setdefault(_q, []).append(pkg)
     return filtered_results
+
+
+def join_search_results(
+        all_search_results: "list[list[SamePackageTypeT]]",
+) -> "Iterable[SamePackageTypeT]":
+    if not all_search_results:
+        return []
+    pkgnames_set: set[str] = set()
+    for search_results in all_search_results:
+        new_pkgnames_set = {get_pkg_id(result) for result in search_results}
+        pkgnames_set = (
+            pkgnames_set.intersection(new_pkgnames_set)
+            if pkgnames_set else
+            new_pkgnames_set
+        )
+    return {
+        get_pkg_id(result): result
+        for result in all_search_results[0]
+        if get_pkg_id(result) in pkgnames_set
+    }.values()
 
 
 def package_search_thread_aur(  # pylint: disable=too-many-branches
@@ -72,7 +79,7 @@ def package_search_thread_aur(  # pylint: disable=too-many-branches
         with ThreadPool() as pool:
             requests = {}
             for query in queries:
-                requests[query] = pool.apply_async(aur_rpc_search_name_desc, (query, ))
+                requests[query] = pool.apply_async(aur_rpc_search, (query, ))
             pool.close()
             for query, request in requests.items():
                 try:
@@ -96,7 +103,7 @@ def package_search_thread_aur(  # pylint: disable=too-many-branches
                         raise
             pool.join()
         for query in use_as_filters:
-            result = filter_aur_results(result, query, names_only=args.namesonly)
+            result = filter_search_results(result, query, names_only=args.namesonly)
         if args.namesonly:
             for subindex, subresult in result.items():
                 result[subindex] = [
@@ -118,6 +125,45 @@ def package_search_thread_aur(  # pylint: disable=too-many-branches
     return list(join_search_results(list(result.values())))
 
 
+def package_search_thread_repo_worker(
+        query: str, db_names: list[str] | None = None,
+) -> "list[pyalpm.Package]":
+    args = parse_args()
+    result = (
+        PackageDB.search_repo(query, names_only=args.namesonly, db_names=db_names)
+        if (query or db_names) else
+        PackageDB.get_repo_list(quiet=True)
+    )
+    if not args.quiet:
+        sys.stderr.write("#")
+    return result
+
+
+def package_search_thread_repo(
+        search_query: list[str], db_names: list[str] | None = None,
+) -> "list[pyalpm.Package]":
+    args = parse_args()
+    use_as_filters: list[str] = []
+    result_repo = {}
+    with ThreadPool() as pool:
+        requests_repo = {
+            search_word: pool.apply_async(
+                package_search_thread_repo_worker, (search_word, db_names),
+            )
+            for search_word in (search_query or [""])
+        }
+        for search_word, request_repo in requests_repo.items():
+            pkgs_found = request_repo.get()
+            if pkgs_found:
+                result_repo[search_word] = pkgs_found
+            else:
+                use_as_filters.append(search_word)
+        for query in use_as_filters:
+            result_repo = filter_search_results(result_repo, query, names_only=args.namesonly)
+    joined_repo_results = join_search_results(list(result_repo.values()))
+    return list(joined_repo_results)
+
+
 def package_search_thread_local() -> dict[str, str]:
     result = {
         pkg_name: pkg.version
@@ -128,34 +174,14 @@ def package_search_thread_local() -> dict[str, str]:
     return result
 
 
-def join_search_results(
-        all_search_results: "list[list[SamePackageTypeT]]",
-) -> "Iterable[SamePackageTypeT]":
-    if not all_search_results:
-        return []
-    pkgnames_set: set[str] = set()
-    for search_results in all_search_results:
-        new_pkgnames_set = {get_pkg_id(result) for result in search_results}
-        pkgnames_set = (
-            pkgnames_set.intersection(new_pkgnames_set)
-            if pkgnames_set else
-            new_pkgnames_set
-        )
-    return {
-        get_pkg_id(result): result
-        for result in all_search_results[0]
-        if get_pkg_id(result) in pkgnames_set
-    }.values()
-
-
-def search_packages(  # noqa: PLR0914
+def search_packages(
         *, enumerated: bool = False,
 ) -> "list[AnyPackage]":
     refresh_pkg_db_if_needed()
 
     args = parse_args()
     search_query = ((not args.list) and args.positional) or []
-    repo_query = (args.list and args.positional) or None
+    repo_query = args.positional if args.list else None
     repo_only = (
         args.repo
         or (
@@ -180,22 +206,17 @@ def search_packages(  # noqa: PLR0914
 
     with ThreadPool() as pool:
         request_local = pool.apply_async(package_search_thread_local, ())
-        requests_repo = [
-            pool.apply_async(package_search_thread_repo, (search_word, repo_query))
-            for search_word in (search_query or [""])
-        ] if not aur_only else []
+        request_repo = pool.apply_async(
+            package_search_thread_repo, (search_query, repo_query),
+        ) if not aur_only else None
         request_aur = pool.apply_async(
             package_search_thread_aur, (search_query,),
         ) if not repo_only else None
         pool.close()
 
         result_local = request_local.get()
-        result_repo: list[list[pyalpm.Package]] = []
-        for request_repo in requests_repo:
-            pkgs_found = request_repo.get()
-            if pkgs_found:
-                result_repo.append(pkgs_found)
-        result_aur = None
+        result_repo = request_repo.get() if request_repo else []
+        result_aur = []
         if request_aur:
             try:
                 result_aur = request_aur.get()
@@ -208,14 +229,9 @@ def search_packages(  # noqa: PLR0914
     if not args.quiet:
         sys.stderr.write("\n")
 
-    joined_repo_results: Iterable[pyalpm.Package] = []
-    if result_repo:
-        joined_repo_results = join_search_results(result_repo)
-    joined_aur_results: Iterable[AURPackageInfo] = result_aur or []
-
     return print_package_search_results(
-        repo_packages=joined_repo_results,
-        aur_packages=joined_aur_results,
+        repo_packages=result_repo,
+        aur_packages=result_aur,
         local_pkgs_versions=result_local,
         enumerated=enumerated,
         list_mode=bool(args.list),

@@ -6,11 +6,8 @@ WORKDIR /opt/app-build/
 ARG GITHUB_TOKEN
 ARG GITHUB_RUN_ID
 ARG GITHUB_REF
-ARG MODE=--local
-ARG TESTSUITE=all
-ARG SKIP_LINTING=0
 
-RUN echo 'Server = https://mirrors.xtom.nl/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist ; \
+RUN echo 'Server = https://mirrors.xtom.nl/archlinux/$repo/os/$arch' > /etc/pacman.d/mirrorlist ; \
 	echo 'Server = https://archlinux.mirror.pcextreme.nl/$repo/os/$arch' >> /etc/pacman.d/mirrorlist ; \
 	echo 'Server = https://archlinux.mirror.wearetriple.com/$repo/os/$arch' >> /etc/pacman.d/mirrorlist ; \
 	echo 'Server = https://mirror.mijn.host/archlinux/$repo/os/$arch' >> /etc/pacman.d/mirrorlist ; \
@@ -28,14 +25,17 @@ ENV LANG=en_US.utf8 \
 	LANGUAGE=en_US.UTF-8 \
 	LC_ALL=en_US.UTF-8
 
-COPY ./maintenance_scripts/pikaman.py /opt/app-build/maintenance_scripts/pikaman.py
+RUN echo ">>>> Installing optional pikaur deps:" && \
+	pacman -Sy devtools python-pysocks python-defusedxml --noconfirm --needed
+
+COPY ./maintenance_scripts/pikaman.py ./maintenance_scripts/changelog.sh /opt/app-build/maintenance_scripts/
 COPY ./packaging/. /opt/app-build/packaging
+COPY ./submodules/. /opt/app-build/submodules
 COPY ./locale/. /opt/app-build/locale
-COPY ./PKGBUILD ./Makefile ./README.md ./pyproject.toml ./LICENSE /opt/app-build/
+COPY ./PKGBUILD ./Makefile ./README.md ./pyproject.toml ./.flake8 ./LICENSE /opt/app-build/
+COPY ./pikaur_static/. /opt/app-build/pikaur_static
 COPY ./pikaur/. /opt/app-build/pikaur
-RUN echo ">>>> Installing opt deps:" && \
-	pacman -Sy devtools python-pysocks python-defusedxml --noconfirm --needed && \
-	echo ">>>> Preparing build directory:" && \
+RUN echo ">>>> Preparing build directory:" && \
 	chown -R user /opt/app-build/ && \
 	echo ">>>> Fetching git tags:" && \
 	sudo -u user git fetch -t || true && \
@@ -43,23 +43,28 @@ RUN echo ">>>> Installing opt deps:" && \
 	sudo -u user tar --transform 's,^,pikaur-git/,' -cf pikaur-git.tar.gz . && \
 	sudo -u user sed -i 's/"$pkgname::.*"/"pikaur-git.tar.gz"/' PKGBUILD && \
 	echo ">>>> Starting the build:" && \
+	./maintenance_scripts/changelog.sh > CHANGELOG && \
 	sudo -u user makepkg -fsi --noconfirm && \
 	rm -fr ./src/ ./pkg/
-#RUN sudo -u user python -u maintenance_scripts/pidowngrade.py python-coverage '6.5.0-5'
+
+COPY ./pikaur_meta_helpers /opt/app-build/pikaur_meta_helpers
+#RUN sudo -u user python -um pikaur_meta_helpers.pidowngrade python-coverage '7.4.1-1'  # up to 7.4.4
 RUN echo ">>>> Installing test deps using Pikaur itself:" && \
-	sudo -u user pikaur -S --noconfirm --needed --color=always iputils python-virtualenv \
-		flake8 python-pylint mypy vulture bandit shellcheck # @TODO: python-coveralls is temporary broken
-#RUN sudo -u user python -u maintenance_scripts/pidowngrade.py python-pycodestyle '2.9.1-2' # @TODO: remove it when it fixed
+	sudo -u user pikaur -Syu --noconfirm --needed --color=always \
+		ruff flake8 python-pylint mypy vulture bandit shellcheck python-coveralls
 
 COPY ./pikaur_test /opt/app-build/pikaur_test
 COPY ./maintenance_scripts /opt/app-build/maintenance_scripts/
-COPY .flake8 /opt/app-build/
+ARG SKIP_LINTING=0
 RUN echo ">>>> Starting CI linting:" && \
-	chown -R user /opt/app-build/pikaur_test && \
+	chown -R user /opt/app-build/pikaur_{test,meta_helpers} && \
 	if [[ "$SKIP_LINTING" -eq 0 ]] ; then \
 		sudo -u user env \
-		./maintenance_scripts/lint.sh ; \
+		make lint ; \
 	fi
+
+ARG MODE=--local
+ARG TESTSUITE=all
 RUN echo ">>>> Starting CI testsuite:" && \
 	sudo -u user env \
 	GITHUB_ACTIONS=1 \

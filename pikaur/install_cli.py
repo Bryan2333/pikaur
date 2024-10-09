@@ -3,23 +3,22 @@
 # pylint: disable=too-many-lines
 import contextlib
 import hashlib
+import itertools
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING
 
 from .args import parse_args, reconstruct_args
-from .aur import AURPackageInfo
 from .build import PackageBuild, PkgbuildChanged, clone_aur_repos
-from .config import DiffPagerValues, PikaurConfig
-from .conflicts import find_aur_conflicts
-from .core import (
-    PackageSource,
-    chown_to_current,
-    interactive_spawn,
-    open_file,
-    remove_dir,
+from .config import (
+    DECORATION,
+    DEFAULT_CONFIG_ENCODING,
+    DiffPagerValues,
+    PikaurConfig,
+    UsingDynamicUsers,
 )
+from .conflicts import find_aur_conflicts
 from .exceptions import (
     BuildError,
     CloneError,
@@ -32,8 +31,13 @@ from .exceptions import (
 )
 from .i18n import translate
 from .install_info_fetcher import InstallInfoFetcher
-from .logging import create_logger
+from .logging_extras import create_logger
 from .news import News
+from .os_utils import (
+    chown_to_current,
+    open_file,
+    remove_dir,
+)
 from .pacman import (
     PackageDB,
     get_pacman_command,
@@ -41,7 +45,7 @@ from .pacman import (
     refresh_pkg_db_if_needed,
     strip_repo_name,
 )
-from .pprint import (
+from .pikaprint import (
     ColorsHighlight,
     TTYRestoreContext,
     bold_line,
@@ -51,17 +55,14 @@ from .pprint import (
     print_stdout,
     print_warning,
 )
+from .pikatypes import AURPackageInfo, PackageSource
 from .print_department import (
     pretty_format_sysupgrade,
-    print_local_package_newer,
     print_not_found_packages,
-    print_package_downgrading,
-    print_package_uptodate,
 )
 from .privilege import (
     isolate_root_cmd,
     sudo,
-    using_dynamic_users,
 )
 from .prompt import (
     ask_to_continue,
@@ -70,16 +71,23 @@ from .prompt import (
     retry_interactive_command,
     retry_interactive_command_or_exit,
 )
+from .spawn import (
+    interactive_spawn,
+)
 from .srcinfo import SrcInfo
 from .updates import is_devel_pkg
-from .version import compare_versions
+from .version import VersionMatcher, compare_versions
 
 if TYPE_CHECKING:
+    from typing import Final
+
     import pyalpm
 
     from .args import PikaurArgs
 
 logger = create_logger("install_cli")
+
+NEWLINE: "Final" = "\n"
 
 
 def hash_file(filename: str | Path) -> str:  # pragma: no cover
@@ -120,12 +128,47 @@ def _remove_packages(packages_to_be_removed: list[str]) -> None:
         PackageDB.discard_local_cache()
 
 
-class InstallPackagesCLI:  # noqa: PLR0904
+def _get_local_version(package_name: str) -> str:
+    return PackageDB.get_local_dict()[package_name].version
+
+
+def print_package_uptodate(package_name: str, package_source: "PackageSource") -> None:
+    print_warning(
+        translate("{name} {version} {package_source} package is up to date - skipping").format(
+            name=package_name,
+            version=bold_line(_get_local_version(package_name)),
+            package_source=package_source.name,
+        ),
+    )
+
+
+def print_local_package_newer(package_name: str, aur_version: str) -> None:
+    print_warning(
+        translate(
+            "{name} {version} local package is newer than in AUR ({aur_version}) - skipping",
+        ).format(
+            name=package_name,
+            version=bold_line(_get_local_version(package_name)),
+            aur_version=bold_line(aur_version),
+        ),
+    )
+
+
+def print_package_downgrading(package_name: str, downgrade_version: str) -> None:
+    print_warning(
+        translate("Downgrading AUR package {name} {version} to {downgrade_version}").format(
+            name=bold_line(package_name),
+            version=bold_line(_get_local_version(package_name)),
+            downgrade_version=bold_line(downgrade_version),
+        ),
+    )
+
+
+class InstallPackagesCLI:
 
     # User input
     args: "PikaurArgs"
     install_package_names: list[str]
-    # @TODO: define @property for manually_excluded_packages_names+args.ignore:
     manually_excluded_packages_names: list[str]
     resolved_conflicts: list[list[str]]
     reviewed_package_bases: list[str]
@@ -167,7 +210,8 @@ class InstallPackagesCLI:  # noqa: PLR0904
 
         self.not_found_repo_pkgs_names = []
         self.repo_packages_by_name = {}
-        self.package_builds_by_name = {}
+        self.package_builds_by_name: dict[str, PackageBuild] = {}
+        self.package_builds_by_provides: dict[str, PackageBuild] = {}
 
         self.found_conflicts = {}
         self.transactions = {}
@@ -182,7 +226,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
         if self.args.sysupgrade and not self.args.repo:
             message = translate("Starting full AUR upgrade...")
             print_stderr(
-                f"{color_line('::', ColorsHighlight.blue)}"
+                f"{color_line(DECORATION, ColorsHighlight.blue)}"
                 f" {bold_line(message)}",
             )
         if self.args.aur:
@@ -192,6 +236,10 @@ class InstallPackagesCLI:  # noqa: PLR0904
             self.get_info_from_pkgbuilds()
 
         self.main_sequence()
+
+    @property
+    def ignored_pkgnames(self) -> list[str]:
+        return self.manually_excluded_packages_names + self.args.ignore
 
     def _handle_refresh(self) -> None:
         if not self.args.aur and (self.args.sysupgrade or self.args.refresh):
@@ -257,23 +305,29 @@ class InstallPackagesCLI:  # noqa: PLR0904
         self.install_package_names = []
         self.not_found_repo_pkgs_names = []
         self.pkgbuilds_packagelists = {
-            path: [] for path in
+            Path(path).resolve().as_posix(): [] for path in
             self.args.positional or ["PKGBUILD"]
         }
+
+    def _get_pkgbuild_for_name_or_provided(self, pkg_name: str) -> PackageBuild:
+        return (
+            self.package_builds_by_name.get(pkg_name)
+            or self.package_builds_by_provides[pkg_name]
+        )
 
     def edit_pkgbuild_during_the_build(self, pkg_name: str) -> None:
         updated_pkgbuilds = self._clone_aur_repos([pkg_name])
         if not updated_pkgbuilds:
             return
         self.package_builds_by_name.update(updated_pkgbuilds)
-        pkg_build = self.package_builds_by_name[pkg_name]
+        pkg_build = self._get_pkgbuild_for_name_or_provided(pkg_name)
         if not edit_file(
                 pkg_build.pkgbuild_path,
         ):
             print_warning(translate("PKGBUILD appears unchanged after editing"))
         else:
             self.handle_pkgbuild_changed(pkg_build)
-        self._ignore_package(pkg_name)
+        self.discard_install_info(pkg_name, ignore=False)
         self.pkgbuilds_packagelists[str(pkg_build.pkgbuild_path)] = pkg_build.package_names
 
     def aur_pkg_not_found_prompt(self, pkg_name: str) -> None:  # pragma: no cover
@@ -286,9 +340,9 @@ class InstallPackagesCLI:  # noqa: PLR0904
         ]
         answer = get_input(
             (
-                f"{color_line('::', ColorsHighlight.yellow)}"
+                f"{color_line(DECORATION, ColorsHighlight.yellow)}"
                 f" {question}\n"
-                f"{'\n'.join(options)}\n> "
+                f"{NEWLINE.join(options)}\n> "
             ),
             translate("e") + translate("f") + translate("s") + translate("a").upper(),
         ).lower()[0]
@@ -299,7 +353,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
             self.skip_checkfunc_for_pkgnames.append(pkg_name)
             self.main_sequence()
         elif answer == translate("s"):
-            self._ignore_package(pkg_name)
+            self.discard_install_info(pkg_name)
         else:  # "A"
             raise SysExit(125)
 
@@ -312,9 +366,9 @@ class InstallPackagesCLI:  # noqa: PLR0904
         ]
         answer = get_input(
             (
-                f"{color_line('::', ColorsHighlight.yellow)}"
+                f"{color_line(DECORATION, ColorsHighlight.yellow)}"
                 f" {question}\n"
-                f"{'\n'.join(options)}\n> "
+                f"{NEWLINE.join(options)}\n> "
             ),
             translate("e") + translate("s") + translate("a").upper(),
         ).lower()[0]
@@ -322,7 +376,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
             self.edit_pkgbuild_during_the_build(pkg_name)
             self.main_sequence()
         elif answer == translate("s"):
-            self._ignore_package(pkg_name)
+            self.discard_install_info(pkg_name)
         else:  # "A"
             raise SysExit(125)
 
@@ -334,7 +388,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
         # deal with package names which user explicitly wants to install
         self.repo_packages_by_name = {}
 
-        for pkg_name in self.manually_excluded_packages_names:
+        for pkg_name in self.ignored_pkgnames:
             if pkg_name in self.install_package_names:
                 self.install_package_names.remove(pkg_name)
 
@@ -344,17 +398,21 @@ class InstallPackagesCLI:  # noqa: PLR0904
                 not_found_repo_pkgs_names=self.not_found_repo_pkgs_names,
                 pkgbuilds_packagelists=self.pkgbuilds_packagelists,
                 manually_excluded_packages_names=(
-                    self.manually_excluded_packages_names + self.args.ignore
+                    self.ignored_pkgnames
                 ),
                 skip_checkdeps_for_pkgnames=self.skip_checkfunc_for_pkgnames,
             )
         except PackagesNotFoundInAURError as exc:
+            logger.debug(
+                "exception during install info fetch: {}: {}",
+                exc.__class__.__name__, exc,
+            )
             if exc.wanted_by:
                 print_error(bold_line(
                     translate("Dependencies missing for {}").format(", ".join(exc.wanted_by)),
                 ))
                 print_not_found_packages(exc.packages)
-                for pkg_name in exc.wanted_by:  # pylint: disable=not-an-iterable
+                for pkg_name in exc.wanted_by:
                     self.aur_pkg_not_found_prompt(pkg_name)
                 self.get_all_packages_info()
                 return
@@ -363,7 +421,9 @@ class InstallPackagesCLI:  # noqa: PLR0904
         except DependencyVersionMismatchError as exc:
             print_stderr(color_line(translate("Version mismatch:"), ColorsHighlight.yellow))
             print_stderr(
-                translate("{what} depends on: '{dep}'\n found in '{location}': '{version}'").format(
+                translate(
+                    "{what} depends on: '{dep}'\n found in '{location}': '{version}'",
+                ).format(
                     what=bold_line(exc.who_depends),
                     dep=exc.dependency_line,
                     location=exc.location,
@@ -438,18 +498,10 @@ class InstallPackagesCLI:  # noqa: PLR0904
                 self.install_repo_packages()
             else:
                 print_stdout(" ".join((
-                    color_line("::", ColorsHighlight.green),
+                    color_line(DECORATION, ColorsHighlight.green),
                     translate("Nothing to do."),
                 )))
             raise SysExit(0)
-
-    def _ignore_package(self, pkg_name: str) -> None:
-        self.manually_excluded_packages_names.append(pkg_name)
-        for name in (pkg_name, strip_repo_name(pkg_name)):
-            if name in self.install_package_names:
-                self.install_package_names.remove(name)
-            if name in self.not_found_repo_pkgs_names:
-                self.not_found_repo_pkgs_names.remove(name)
 
     def manual_package_selection(self) -> None:  # pragma: no cover
 
@@ -459,7 +511,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
                 line = raw_line.lstrip()
                 if not line:
                     continue
-                if not line.startswith("::") and not line.startswith("#"):
+                if not line.startswith(DECORATION) and not line.startswith("#"):
                     pkg_name = line.split()[0]
                     # for provided package selection: (mb later for optional deps)
                     pkg_name = pkg_name.split("#")[0].strip()
@@ -472,11 +524,11 @@ class InstallPackagesCLI:  # noqa: PLR0904
         )
         pkg_names_before = parse_pkg_names(text_before)
         with NamedTemporaryFile() as tmp_file:
-            with open_file(tmp_file.name, "w") as write_file:
+            with open_file(tmp_file.name, "w", encoding=DEFAULT_CONFIG_ENCODING) as write_file:
                 write_file.write(text_before)
             chown_to_current(Path(tmp_file.name))
             edit_file(tmp_file.name)
-            with open_file(tmp_file.name, "r") as read_file:
+            with open_file(tmp_file.name, "r", encoding=DEFAULT_CONFIG_ENCODING) as read_file:
                 selected_packages = parse_pkg_names(read_file.read())
 
         list_diff = selected_packages.difference(pkg_names_before)
@@ -487,38 +539,60 @@ class InstallPackagesCLI:  # noqa: PLR0904
                 self.install_package_names.append(pkg_name)
 
         for pkg_name in pkg_names_before.difference(selected_packages):
-            self._ignore_package(pkg_name)
+            self.discard_install_info(pkg_name)
 
     def install_prompt(self) -> None:  # pragma: no cover
 
-        def _print_sysupgrade(*, verbose: bool = False) -> None:
+        def _print_sysupgrade(
+                *, verbose: bool = False, required_by_installed: bool = False,
+        ) -> None:
             print_stdout(pretty_format_sysupgrade(
                 install_info=self.install_info,
                 verbose=verbose,
+                required_by_installed=required_by_installed,
             ))
 
-        def _confirm_sysupgrade(*, verbose: bool = False, print_pkgs: bool = True) -> str:
+        verbose = False
+        required_by_installed = False
+
+        def _confirm_sysupgrade(
+                *,
+                verbose: bool = False,
+                print_pkgs: bool = True,
+                required_by_installed: bool = False,
+        ) -> str:
             if print_pkgs:
-                _print_sysupgrade(verbose=verbose)
+                _print_sysupgrade(verbose=verbose, required_by_installed=required_by_installed)
             question = translate("Proceed with installation? [Y/n] ")
-            options_line1 = translate("[v]iew package details   [m]anually select packages")
-            prompt = (
-                f"{color_line('::', ColorsHighlight.blue)}"
-                f" {bold_line(question)}"
-                f"\n{color_line('::', ColorsHighlight.blue)}"
-                f" {bold_line(options_line1)}"
+            options_lines = (
+                translate("[v]iew package details   [m]anually select packages"),
+                translate("[r] show if packages are required by already installed packages"),
+            )
+            prompt = "".join((
+                (
+                    f"{color_line(DECORATION, ColorsHighlight.blue)}"
+                    f" {bold_line(question)}"
+                ),
+                *(
+                    f"\n{color_line(DECORATION, ColorsHighlight.blue)}"
+                    f" {bold_line(options_line)}"
+                    for options_line
+                    in options_lines
+                ),
+            ))
+            answers = (
+                translate("y").upper() + translate("n") + translate("v") + translate("m")
+                + translate("r")
             )
             if self.news and self.news.any_news:
                 options_news = translate("[c]onfirm Arch NEWS as read")
                 prompt += (
-                    f"\n{color_line('::', ColorsHighlight.blue)}"
+                    f"\n{color_line(DECORATION, ColorsHighlight.blue)}"
                     f" {bold_line(options_news)}"
                 )
+                answers += translate("c")
             prompt += "\n>> "
-            return get_input(
-                prompt,
-                translate("y").upper() + translate("n") + translate("v") + translate("m"),
-            )
+            return get_input(prompt, answers)
 
         if self.args.noconfirm:
             _print_sysupgrade()
@@ -531,8 +605,27 @@ class InstallPackagesCLI:  # noqa: PLR0904
                 letter = answer.lower()[0]
                 if letter == translate("y"):
                     break
+                if answer in (
+                        "".join(combo)
+                        for combo in itertools.permutations((translate("v"), translate("r")))
+                ):
+                    required_by_installed = not required_by_installed
+                    verbose = not verbose
+                    answer = _confirm_sysupgrade(
+                        verbose=verbose, required_by_installed=required_by_installed,
+                    )
+                    continue
                 if letter == translate("v"):
-                    answer = _confirm_sysupgrade(verbose=True)
+                    verbose = not verbose
+                    answer = _confirm_sysupgrade(
+                        verbose=verbose, required_by_installed=required_by_installed,
+                    )
+                    continue
+                if letter == translate("r"):
+                    required_by_installed = not required_by_installed
+                    answer = _confirm_sysupgrade(
+                        verbose=verbose, required_by_installed=required_by_installed,
+                    )
                     continue
                 if letter == translate("m"):
                     print_stdout()
@@ -571,7 +664,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
             pkgbuild.get_deps(
                 all_package_builds=all_package_builds,
                 filter_built=False,
-                exclude_pkg_names=self.manually_excluded_packages_names,
+                exclude_pkg_names=self.ignored_pkgnames,
             )
 
             aur_pkgs: list[AURPackageInfo] = [
@@ -592,7 +685,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
 
             srcinfo_deps: set[str] = set()
             for package_name in pkgbuild.package_names:
-                if package_name in self.manually_excluded_packages_names:
+                if package_name in self.ignored_pkgnames:
                     continue
                 src_info = SrcInfo(pkgbuild_path=pkgbuild.pkgbuild_path, package_name=package_name)
                 srcinfo_deps.update({
@@ -664,7 +757,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
                     answer = translate("a")
                 else:  # pragma: no cover
                     prompt = "{} {}\n> ".format(
-                        color_line("::", ColorsHighlight.yellow),
+                        color_line(DECORATION, ColorsHighlight.yellow),
                         "\n".join((
                             translate("Try recovering?"),
                             translate("[T] try again"),
@@ -710,31 +803,42 @@ class InstallPackagesCLI:  # noqa: PLR0904
                 return pkgbuild_by_name
 
     def get_package_builds(self) -> None:
+        logger.debug("<< GET_PACKAGE_BUILD")
+        logger.debug("self.pkgbuilds_packagelists={}", self.pkgbuilds_packagelists)
         while self.all_aur_packages_names:
-            clone_names = []
+            clone_infos = []
             pkgbuilds_by_base: dict[str, PackageBuild] = {}
             pkgbuilds_by_name = {}
+            pkgbuilds_by_provides = {}
             for info in self.install_info.aur_install_info:
                 if info.pkgbuild_path:
                     if not isinstance(info.package, AURPackageInfo):
                         raise TypeError
                     pkg_base = info.package.packagebase
                     if pkg_base not in pkgbuilds_by_base:
-                        package_names = self.pkgbuilds_packagelists.get(info.pkgbuild_path)
+                        package_names = self.pkgbuilds_packagelists.get(info.pkgbuild_path, [])
                         logger.debug(
-                            "Initializing build info for {}({}): {}",
-                            pkg_base, package_names, info.pkgbuild_path,
+                            "Initializing build info for {} {}({}): {}",
+                            info, pkg_base, package_names, info.pkgbuild_path,
                         )
                         pkgbuilds_by_base[pkg_base] = PackageBuild(
                             pkgbuild_path=info.pkgbuild_path,
                             package_names=package_names,
                         )
                     pkgbuilds_by_name[info.name] = pkgbuilds_by_base[pkg_base]
+                    for provided_str in info.package.provides:
+                        provided_name = VersionMatcher(provided_str).pkg_name
+                        pkgbuilds_by_provides[provided_name] = pkgbuilds_by_base[pkg_base]
                 else:
-                    clone_names.append(info.name)
-            cloned_pkgbuilds = self._clone_aur_repos(clone_names)
+                    clone_infos.append(info)
+            cloned_pkgbuilds = self._clone_aur_repos([info.name for info in clone_infos])
             if cloned_pkgbuilds:
+                logger.debug("cloned_pkgbuilds={}", cloned_pkgbuilds)
                 pkgbuilds_by_name.update(cloned_pkgbuilds)
+                for info in clone_infos:
+                    for provided_str in info.package.provides:
+                        provided_name = VersionMatcher(provided_str).pkg_name
+                        pkgbuilds_by_provides[provided_name] = cloned_pkgbuilds[info.package.name]
             for pkg_list in (self.aur_packages_names, self.aur_deps_names):
                 self._find_extra_aur_build_deps(
                     all_package_builds={
@@ -744,7 +848,11 @@ class InstallPackagesCLI:  # noqa: PLR0904
                     },
                 )
             self.package_builds_by_name = pkgbuilds_by_name
+            self.package_builds_by_provides = pkgbuilds_by_provides
             break
+        logger.debug("self.package_builds_by_name={}", self.package_builds_by_name)
+        logger.debug("self.package_builds_by_provides={}", self.package_builds_by_provides)
+        logger.debug(">> GET_PACKAGE_BUILD")
 
     def ask_about_package_conflicts(self) -> None:
         if self.aur_packages_names or self.aur_deps_names:
@@ -775,7 +883,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
                     new=new_pkg_name, installed=pkg_conflict,
                 )
                 answer = ask_to_continue(
-                    f"{color_line('::', ColorsHighlight.yellow)} {bold_line(question)}",
+                    f"{color_line(DECORATION, ColorsHighlight.yellow)} {bold_line(question)}",
                     default_yes=False,
                 )
                 if not answer:
@@ -794,7 +902,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
                 name=", ".join(package_build.package_names),
                 flag=(noedit and "--noedit") or (self.args.noconfirm and "--noconfirm"),
             )
-            print_stderr(f"{color_line('::', ColorsHighlight.yellow)} {message}")
+            print_stderr(f"{color_line(DECORATION, ColorsHighlight.yellow)} {message}")
             return False
         if not ask_to_continue(
                 translate("Do you want to {edit} {file} for {name} package?").format(
@@ -815,7 +923,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
         # if running as root get sources for dev packages synchronously
         # (to prevent race condition in systemd dynamic users)
         num_threads: int | None = None
-        if using_dynamic_users():  # pragma: no cover
+        if UsingDynamicUsers():  # pragma: no cover
             num_threads = 1
 
         # check if pkgs versions already installed
@@ -991,7 +1099,8 @@ class InstallPackagesCLI:  # noqa: PLR0904
         src_info.regenerate()
         new_srcinfo_hash = hash_file(src_info.path)
 
-        self.pkgbuilds_packagelists[str(pkg_build.pkgbuild_path)] = pkg_build.package_names
+        pkgbuild_path_str = pkg_build.pkgbuild_path.as_posix()
+        self.pkgbuilds_packagelists[pkgbuild_path_str] = pkg_build.package_names
         self.reviewed_package_bases.append(pkg_build.package_base)
 
         if not getattr(self, "install_info", None):  # @TODO: make it nicer?
@@ -1021,7 +1130,8 @@ class InstallPackagesCLI:  # noqa: PLR0904
             self.main_sequence()
             raise self.ExitMainSequence
 
-    def build_packages(self) -> None:  # pylint: disable=too-many-branches
+    def build_packages(self) -> None:  # pylint: disable=too-many-branches,too-many-statements
+        logger.debug("<< BUILD PACKAGES")
         if self.args.needed or self.args.devel:
             self._get_installed_status()
 
@@ -1030,30 +1140,33 @@ class InstallPackagesCLI:  # noqa: PLR0904
         packages_to_be_built = self.all_aur_packages_names[:]
         index = 0
         while packages_to_be_built:
-            logger.debug("Gonna build PKGBUILDS: {}", self.package_builds_by_name)
+            logger.debug("  Packages to be built: {}", packages_to_be_built)
+            logger.debug("  Gonna build PKGBUILDS: {}", self.package_builds_by_name)
             if index >= len(packages_to_be_built):
                 index = 0
 
             pkg_name = packages_to_be_built[index]
-            pkg_build = self.package_builds_by_name[pkg_name]
+            pkg_build = self._get_pkgbuild_for_name_or_provided(pkg_name)
             pkg_base = pkg_build.package_base
             if (
                 pkg_base in self.built_package_bases
             ) or (
                     self.args.needed and pkg_build.version_already_installed
             ):
-                logger.debug("Already built: {}", pkg_base)
+                logger.debug("  Already built: {}", pkg_base)
+                pkg_build.set_built_package_path()
                 packages_to_be_built.remove(pkg_name)
                 continue
 
             try:
-                logger.debug("Gonna build pkgnames: {}", pkg_build.package_names)
+                logger.debug("  Gonna build pkgnames: {}", pkg_build.package_names)
                 pkg_build.build(
                     all_package_builds=self.package_builds_by_name,
                     resolved_conflicts=self.resolved_conflicts,
                     skip_checkfunc_for_pkgnames=self.skip_checkfunc_for_pkgnames,
                 )
-            except PkgbuildChanged:
+            except PkgbuildChanged as exc:
+                logger.debug("  PKGBUILD changed: {}", exc)
                 self.handle_pkgbuild_changed(pkg_build)
             except (BuildError, DependencyError) as exc:
                 print_stderr(exc)
@@ -1073,7 +1186,8 @@ class InstallPackagesCLI:  # noqa: PLR0904
                     for remaining_aur_pkg_name in packages_to_be_built[:]:
                         if remaining_aur_pkg_name not in self.all_aur_packages_names:
                             packages_to_be_built.remove(remaining_aur_pkg_name)
-            except DependencyNotBuiltYetError:
+            except DependencyNotBuiltYetError as exc:
+                logger.debug("  {} Dep not built yet: {}", index, exc)
                 index += 1
                 for _pkg_name in pkg_build.package_names:
                     deps_fails_counter.setdefault(_pkg_name, 0)
@@ -1087,15 +1201,21 @@ class InstallPackagesCLI:  # noqa: PLR0904
                         self.prompt_dependency_cycle(_pkg_name)
             else:
                 logger.debug(
-                    "Build done for packages {}, removing from queue",
+                    "  Build done for packages {}, removing from queue {}",
                     pkg_build.package_names,
+                    packages_to_be_built,
                 )
                 self.built_package_bases.append(pkg_base)
-                for _pkg_name in pkg_build.package_names:
-                    if _pkg_name not in self.manually_excluded_packages_names:
+                for _pkg_name in pkg_build.package_names + pkg_build.provides:
+                    if (
+                            (_pkg_name not in self.ignored_pkgnames)
+                            and (_pkg_name in packages_to_be_built)
+                    ):
                         packages_to_be_built.remove(_pkg_name)
+            logger.debug("")
 
         self.failed_to_build_package_names = failed_to_build_package_names
+        logger.debug(">> BUILD PACKAGES")
 
     def _save_transaction(
             self,
@@ -1132,7 +1252,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
         extra_args: list[str] = []
         if not (self.install_package_names or self.args.sysupgrade):
             return
-        for excluded_pkg_name in self.manually_excluded_packages_names + self.args.ignore:
+        for excluded_pkg_name in self.ignored_pkgnames:
             # pacman's --ignore doesn't work with repo name:
             extra_args.extend(("--ignore", strip_repo_name(excluded_pkg_name)))
         if not retry_interactive_command(
@@ -1154,10 +1274,11 @@ class InstallPackagesCLI:  # noqa: PLR0904
         )
 
     def install_new_aur_deps(self) -> None:
-        new_aur_deps_to_install = {
-            pkg_name: self.package_builds_by_name[pkg_name].built_packages_paths[pkg_name]
-            for pkg_name in self.aur_deps_names
-        }
+        new_aur_deps_to_install = {}
+        for pkg_name in self.aur_deps_names:
+            pkg_build = self._get_pkgbuild_for_name_or_provided(pkg_name)
+            for name in pkg_build.package_names:
+                new_aur_deps_to_install[name] = pkg_build.built_packages_paths[name]
         try:
             install_built_deps(
                 deps_names_and_paths=new_aur_deps_to_install,
@@ -1175,7 +1296,7 @@ class InstallPackagesCLI:  # noqa: PLR0904
     def install_aur_packages(self) -> None:
         aur_packages_to_install = {}
         for pkg_name in self.aur_packages_names:
-            pkg_build = self.package_builds_by_name.get(pkg_name)
+            pkg_build = self._get_pkgbuild_for_name_or_provided(pkg_name)
             if pkg_build:
                 path = pkg_build.built_packages_paths.get(pkg_name)
                 if path:

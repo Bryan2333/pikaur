@@ -4,17 +4,22 @@ import operator
 import sys
 from datetime import datetime
 from fnmatch import fnmatch
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import pyalpm
 
+from .alpm import OFFICIAL_REPOS, PyAlpmWrapper
 from .args import parse_args
-from .aur import AURPackageInfo
-from .config import VERSION, AurSearchSortingValues, PikaurConfig, UpgradeSortingValues
-from .core import DEFAULT_TIMEZONE, InstallInfo
+from .config import (
+    DECORATION,
+    DEFAULT_TIMEZONE,
+    VERSION,
+    AurSearchSortingValues,
+    PikaurConfig,
+    UpgradeSortingValues,
+)
 from .i18n import translate, translate_many
-from .pacman import OFFICIAL_REPOS, PackageDB
-from .pprint import (
+from .pikaprint import (
     Colors,
     ColorsHighlight,
     bold_line,
@@ -24,7 +29,11 @@ from .pprint import (
     print_stderr,
     print_stdout,
     print_warning,
+    printable_length,
+    sidejoin_multiline_paragraphs,
 )
+from .pikasay import PIKAPIC
+from .pikatypes import AURPackageInfo, InstallInfo
 from .version import get_common_version, get_version_diff
 
 if TYPE_CHECKING:
@@ -32,8 +41,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
     from typing import Final, TypeVar
 
-    from .core import AURInstallInfo, PackageSource, RepoInstallInfo
     from .install_info_fetcher import InstallInfoFetcher
+    from .pikatypes import AURInstallInfo, RepoInstallInfo
 
     AnyPackage = AURPackageInfo | pyalpm.Package
     InstallInfoT = TypeVar("InstallInfoT", bound=InstallInfo)
@@ -50,19 +59,24 @@ def print_version(pacman_version: str, pyalpm_version: str, *, quiet: bool = Fal
         print_stdout(f"{pacman_version} - pyalpm v{pyalpm_version}")
     else:
         year = str(datetime.now(tz=DEFAULT_TIMEZONE).year)
-        sys.stdout.write(r"""
-      /:}               _
-     /--1             / :}
-    /   |           / `-/
-   |  ,  --------  /   /     Pikaur v""" + VERSION + r"""
-   |'                 Y      (C) 2018-""" + year + r""" Pikaur development team
-  /                   l      Licensed under GPLv3
-  l  /       \        l
-  j  ●   .   ●        l      """ + pacman_version + r"""
- { )  ._,.__,   , -.  {      pyalpm v""" + pyalpm_version + r"""
-  Y    \  _/     ._/   \
+        sys.stdout.write(
+            sidejoin_multiline_paragraphs(
+                "   ", (
+                    PIKAPIC,
+                    r"""
 
-""")
+
+
+Pikaur v""" + VERSION + r"""
+(C) 2018-""" + year + r""" Pikaur development team
+Licensed under GPLv3
+
+""" + pacman_version + r"""
+pyalpm v""" + pyalpm_version + r"""
+""",
+                ), auto_column=True,
+            ) + "\n",
+        )
 
 
 def print_not_found_packages(not_found_packages: list[str], *, repo: bool = False) -> None:
@@ -102,7 +116,7 @@ class RepoColorGenerator:
         cls._init_done = True
         for official_repo_name in OFFICIAL_REPOS:
             cls.get_next("repo", official_repo_name)
-        for repo in PackageDB.get_alpm_handle().get_syncdbs():
+        for repo in PyAlpmWrapper.get_alpm_handle().get_syncdbs():
             cls.get_next("repo", repo.name)
 
     @classmethod
@@ -133,13 +147,21 @@ def pretty_format_repo_name(
     return color_line(result, RepoColorGenerator.get_next("repo", repo_name))
 
 
-def pretty_format_upgradeable(  # pylint: disable=too-many-statements
+def pretty_format_upgradeable(  # pylint: disable=too-many-statements  # noqa: C901
         packages_updates: "Sequence[InstallInfo]",
         *,
         verbose: bool = False,
+        required_by_installed: bool = False,
         print_repo: bool = False,
         color: bool = True,
-        template: str | None = None,
+        template: str = (
+            " {pkg_name}{spacing}"
+            " {current_version}{spacing2}"
+            "{version_separator}{new_version}{spacing3}"
+            "{pkg_size}{days_old}{out_of_date}"
+            "{required_by_installed}"
+            "{verbose}"
+        ),
 ) -> str:
     parent_color = color
 
@@ -165,7 +187,7 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
         tuple[int, str] | str
     )
 
-    def pretty_format(  # pylint:disable=R0912  # noqa: PLR0914
+    def pretty_format(  # pylint:disable=R0912
             pkg_update: "InstallInfo",
     ) -> tuple[str, type_sort_key]:
         common_version, diff_weight = get_common_version(
@@ -191,44 +213,67 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
                 pkg_update.name,
             )
 
-        pkg_name = pkg_update.name
-        pkg_len = len(pkg_update.name)
-
-        pkg_name = _bold_line(pkg_name)
+        pkg_name = _bold_line(pkg_update.name)
         if (print_repo or verbose) and pkg_update.repository:
             pkg_name = f"{pretty_format_repo_name(pkg_update.repository, color=color)}{pkg_name}"
-            pkg_len += len(pkg_update.repository) + 1
         elif print_repo:
             pkg_name = f"{_color_line('aur/', ColorsHighlight.red)}{pkg_name}"
-            pkg_len += len("aur/")
 
-        if pkg_update.required_by:
-            required_for = translate("for {pkg}").format(
-                pkg=", ".join([p.package.name for p in pkg_update.required_by]),
-            )
-            required_by = f" ({required_for})"
-            pkg_len += len(required_by)
-            dep_color = Colors.yellow
-            required_for_formatted = translate("for {pkg}").format(
+        def pformat_deps(
+                required_by_names: list[str],
+                dep_color: int,
+                template: str = translate("for {pkg}"),
+        ) -> str:
+            if not required_by_names:
+                return ""
+            required_for_formatted = template.format(
                 pkg=_color_line(", ", dep_color).join([
-                    _color_line(p.package.name, dep_color + 8) for p in pkg_update.required_by
+                    _color_line(name, dep_color + 8) for name in required_by_names
                 ]) + _color_line("", dep_color, reset=False),
             )
-            required_by_formatted = _color_line(f" ({required_for_formatted})", dep_color)
-            pkg_name += required_by_formatted
+            return _color_line(f"({required_for_formatted})", dep_color)
+
+        if required_by_installed and (pkg_update.installed_as_dependency is not None):
+            message = (
+                (
+                    translate("as dep")
+                    if pkg_update.required_by_installed or not pkg_update.optional_for_installed
+                    else translate("as opt dep")
+                )
+                if pkg_update.installed_as_dependency
+                else translate("explicit")
+            )
+            pkg_name += color_line(
+                f" ({message})",
+                (
+                    (
+                        ColorsHighlight.black
+                        if pkg_update.required_by_installed
+                        else Colors.white
+                    )
+                    if (pkg_update.required_by_installed or pkg_update.optional_for_installed)
+                    else ColorsHighlight.red
+                )
+                if pkg_update.installed_as_dependency
+                else ColorsHighlight.white,
+            )
+
+        if pkg_update.required_by:
+            required_by_names = (
+                [p.package.name for p in pkg_update.required_by] if pkg_update.required_by else []
+            )
+            if required_by_names:
+                required_for_formatted = " " + pformat_deps(
+                    required_by_names=required_by_names, dep_color=Colors.yellow,
+                )
+                pkg_name += required_for_formatted
         if pkg_update.provided_by:
             provided_by = f" ({' # '.join([p.name for p in pkg_update.provided_by])})"
-            pkg_len += len(provided_by)
             pkg_name += _color_line(provided_by, Colors.green)
         if pkg_update.members_of:
             members_template = translate_many(
                 "{grp} group", "{grp} groups", len(pkg_update.members_of),
             )
-            members_list_raw = members_template.format(
-                grp=", ".join(g for g in pkg_update.members_of),
-            )
-            members_of = f" ({members_list_raw})"
-            pkg_len += len(members_of)
             members_list_formatted = members_template.format(
                 grp=_color_line(", ", GROUP_COLOR).join(
                     [_color_line(g, GROUP_COLOR + 8) for g in pkg_update.members_of],
@@ -238,7 +283,6 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
             pkg_name += _color_line(members_of_formatted, GROUP_COLOR)
         if pkg_update.replaces:
             replaces = f" (replaces {', '.join(g for g in pkg_update.replaces)})"
-            pkg_len += len(replaces)
             pkg_name += _color_line(replaces, REPLACEMENTS_COLOR)
             if not color:
                 pkg_name = f"# {pkg_name}"
@@ -260,7 +304,6 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
         ):
             orphaned_text = translate("orphaned")
             orphaned = f" [{orphaned_text}]"
-            pkg_len += len(orphaned)
             pkg_name += _color_line(orphaned, ORPHANED_COLOR)
 
         out_of_date = ""
@@ -278,14 +321,9 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
                 color_config.VersionDiffOld.get_int(),
             )
 
-        return (
-            template or (
-                " {pkg_name}{spacing}"
-                " {current_version}{spacing2}"
-                "{version_separator}{new_version}{spacing3}"
-                "{pkg_size}{days_old}{out_of_date}{verbose}"
-            )
-        ).format(
+        pkg_len = printable_length(pkg_name)
+
+        return template.format(
             pkg_name=pkg_name,
             current_version=(
                 _color_line(common_version, version_color) +
@@ -322,9 +360,40 @@ def pretty_format_upgradeable(  # pylint: disable=too-many-statements
                 "" if not (verbose and pkg_update.description)
                 else f"\n{format_paragraph(pkg_update.description)}"
             ),
+            required_by_installed=(
+                "".join((
+                    part
+                    for template, color, items in (
+                        (
+                            translate("required by {pkg}"),
+                            Colors.cyan, pkg_update.required_by_installed,
+                        ),
+                        (
+                            translate("optional for {pkg}"),
+                            Colors.purple, pkg_update.optional_for_installed,
+                        ),
+                    )
+                    for part in (
+                        "\n",
+                        *format_paragraph(
+                            pformat_deps(
+                                required_by_names=items or [],
+                                dep_color=color,
+                                template=template,
+                            ),
+                            padding=2,
+                        ),
+                    )
+                    if (required_by_installed and items)
+                ))
+            ),
         ), sort_by
 
-    return "\n".join([
+    return (
+        "\n\n"
+        if (verbose and required_by_installed)
+        else "\n"
+    ).join([
         line for line, _ in sorted(
             [
                 pretty_format(pkg_update)
@@ -342,11 +411,13 @@ class SysupgradePrettyFormatter:
         install_info: "InstallInfoFetcher",
         *,
         verbose: bool,
+        required_by_installed: bool,
         manual_package_selection: bool,
     ) -> None:
         self.color = True
         self.install_info = install_info
         self.verbose = verbose
+        self.required_by_installed = required_by_installed
 
         self.repo_packages_updates: list[RepoInstallInfo] = \
             install_info.repo_packages_install_info[::]
@@ -404,23 +475,25 @@ class SysupgradePrettyFormatter:
             print_repo = self.config.sync.AlwaysShowPkgOrigin.get_bool()
         return pretty_format_upgradeable(
             install_infos,
-            verbose=self.verbose, color=self.color, print_repo=print_repo,
+            verbose=self.verbose, required_by_installed=self.required_by_installed,
+            color=self.color, print_repo=print_repo,
         )
 
     def pformat_warned_packages(self) -> None:
         warn_about_packages_str = self.config.ui.WarnAboutPackageUpdates.get_str()
         warn_about_packages_list: list[InstallInfo] = []
 
-        def remove_globs_from_pkg_list(pkg_list: "list[InstallInfoT]") -> None:
-            pkg_install_info: InstallInfoT
-            for pkg_install_info in pkg_list[::]:
-                for glob in globs_and_names:
-                    if fnmatch(pkg_install_info.name, glob):
-                        pkg_list.remove(pkg_install_info)
-                        warn_about_packages_list.append(pkg_install_info)
-
         if warn_about_packages_str:
             globs_and_names = warn_about_packages_str.split(",")
+
+            def remove_globs_from_pkg_list(pkg_list: "list[InstallInfoT]") -> None:
+                pkg_install_info: InstallInfoT
+                for pkg_install_info in pkg_list[::]:
+                    for glob in globs_and_names:
+                        if fnmatch(pkg_install_info.name, glob):
+                            pkg_list.remove(pkg_install_info)
+                            warn_about_packages_list.append(pkg_install_info)
+
             pkg_list: list[RepoInstallInfo] | list[AURInstallInfo]
             for pkg_list in self.all_install_info_lists:
                 remove_globs_from_pkg_list(pkg_list)  # type: ignore[misc]
@@ -433,7 +506,7 @@ class SysupgradePrettyFormatter:
             )
             self.result.append(
                 (
-                    f"\n{self._color_line('::', ColorsHighlight.blue)}"
+                    f"\n{self._color_line(DECORATION, ColorsHighlight.blue)}"
                     f" {self._color_line('!!', ColorsHighlight.red)}"
                     f" {self._color_line(warning_message, ColorsHighlight.red)}"
                     f" {self._color_line('!!', ColorsHighlight.red)}"
@@ -449,7 +522,7 @@ class SysupgradePrettyFormatter:
                 len(self.repo_replacements),
             )
             self.result.append(
-                f"\n{self._color_line('::', ColorsHighlight.blue)}"
+                f"\n{self._color_line(DECORATION, ColorsHighlight.blue)}"
                 f" {self._bold_line(message_repo)}",
             )
             self.result.append(self.pretty_format_upgradeable(
@@ -462,7 +535,7 @@ class SysupgradePrettyFormatter:
                 len(self.repo_packages_updates),
             )
             self.result.append(
-                f"\n{self._color_line('::', ColorsHighlight.blue)}"
+                f"\n{self._color_line(DECORATION, ColorsHighlight.blue)}"
                 f" {self._bold_line(message_third_party)}",
             )
             self.result.append(self.pretty_format_upgradeable(
@@ -477,7 +550,7 @@ class SysupgradePrettyFormatter:
                 len(self.repo_packages_updates),
             )
             self.result.append(
-                f"\n{self._color_line('::', ColorsHighlight.blue)}"
+                f"\n{self._color_line(DECORATION, ColorsHighlight.blue)}"
                 f" {self._bold_line(message_repo)}",
             )
             self.result.append(self.pretty_format_upgradeable(
@@ -490,7 +563,7 @@ class SysupgradePrettyFormatter:
                 len(self.new_repo_deps),
             )
             self.result.append(
-                f"\n{self._color_line('::', ColorsHighlight.yellow)}"
+                f"\n{self._color_line(DECORATION, ColorsHighlight.yellow)}"
                 f" {self._bold_line(message_deps)}",
             )
             self.result.append(self.pretty_format_upgradeable(
@@ -505,7 +578,7 @@ class SysupgradePrettyFormatter:
                 len(self.thirdparty_repo_packages_updates),
             )
             self.result.append(
-                f"\n{self._color_line('::', ColorsHighlight.blue)}"
+                f"\n{self._color_line(DECORATION, ColorsHighlight.blue)}"
                 f" {self._bold_line(message_repo)}",
             )
             self.result.append(self.pretty_format_upgradeable(
@@ -519,7 +592,7 @@ class SysupgradePrettyFormatter:
                 len(self.new_thirdparty_repo_deps),
             )
             self.result.append(
-                f"\n{self._color_line('::', ColorsHighlight.yellow)}"
+                f"\n{self._color_line(DECORATION, ColorsHighlight.yellow)}"
                 f" {self._bold_line(message_deps)}",
             )
             self.result.append(self.pretty_format_upgradeable(
@@ -534,7 +607,7 @@ class SysupgradePrettyFormatter:
                 len(self.aur_updates),
             )
             self.result.append(
-                f"\n{self._color_line('::', ColorsHighlight.cyan)}"
+                f"\n{self._color_line(DECORATION, ColorsHighlight.cyan)}"
                 f" {message_aur}",
             )
             self.result.append(self.pretty_format_upgradeable(
@@ -548,7 +621,7 @@ class SysupgradePrettyFormatter:
                 len(self.new_aur_deps),
             )
             self.result.append(
-                f"\n{self._color_line('::', ColorsHighlight.yellow)}"
+                f"\n{self._color_line(DECORATION, ColorsHighlight.yellow)}"
                 f" {self._bold_line(message_deps)}",
             )
             self.result.append(self.pretty_format_upgradeable(
@@ -584,13 +657,48 @@ def pretty_format_sysupgrade(
         install_info: "InstallInfoFetcher",
         *,
         verbose: bool = False,
+        required_by_installed: bool = False,
         manual_package_selection: bool = False,
 ) -> str:
     return SysupgradePrettyFormatter(
         install_info=install_info,
         verbose=verbose,
+        required_by_installed=required_by_installed,
         manual_package_selection=manual_package_selection,
     )()
+
+
+def pformat_ignored_package(
+        template: str, pkg_name: str,
+        current_version: str | None = None, new_version: str | None = None,
+) -> str:
+    common_version, _diff_weight = get_common_version(
+        current_version or "", new_version or "",
+    )
+    color_config = PikaurConfig().colors
+    common_version_color = color_config.Version.get_int()
+
+    current_version = (
+        color_line(common_version, common_version_color) +
+        color_line(
+            get_version_diff(current_version or "", common_version),
+            color_config.VersionDiffOld.get_int(),
+        )
+    ) if current_version else ""
+
+    new_version = (
+        color_line(common_version, common_version_color) +
+        color_line(
+            get_version_diff(new_version or "", common_version),
+            color_config.VersionDiffNew.get_int(),
+        )
+    ) if new_version else ""
+
+    pkg_name = bold_line(pkg_name)
+
+    return template.format(
+        pkg_name=pkg_name, current_version=current_version, new_version=new_version,
+    )
 
 
 def print_ignored_package(
@@ -598,7 +706,7 @@ def print_ignored_package(
         install_info: InstallInfo | None = None,
         ignored_from: str | None = None,
 ) -> None:
-    if not (package_name or install_info):
+    if (package_name is None) and (install_info is None):
         missing_property_error = translate(
             "Either `{prop1}` or `{prop2}` should be set",
         ).format(
@@ -606,69 +714,41 @@ def print_ignored_package(
             prop2="install_info",
         )
         raise TypeError(missing_property_error)
-    install_info = install_info or InstallInfo(
-        name=package_name,
-        current_version="",
-        new_version="",
-        package=None,
-    )
+    pkg_name = cast(str, install_info.name if install_info else package_name)
+    current_version = install_info.current_version if install_info else ""
+    new_version = install_info.new_version if install_info else ""
     message = " ".join((
-        color_line("::", ColorsHighlight.yellow),
-        translate("Ignoring package update {}").format(
-            pretty_format_upgradeable(
-                [install_info],
-                template="{pkg_name} ({current_version} => {new_version})",
-            ))
-        if (install_info.current_version and install_info.new_version) else
-        translate("Ignoring package {}").format(
-            pretty_format_upgradeable(
-                [install_info],
-                template=(
-                    "{pkg_name} {current_version}"
-                    if install_info.current_version else
-                    "{pkg_name} {new_version}"
+        color_line(DECORATION, ColorsHighlight.yellow),
+        (
+            translate("Ignoring package update {}").format(
+                pformat_ignored_package(
+                    template="{pkg_name} ({current_version} => {new_version})",
+                    pkg_name=pkg_name,
+                    current_version=current_version,
+                    new_version=new_version,
+                ))
+            if (current_version and new_version) else
+            translate("Ignoring package {}").format(
+                pformat_ignored_package(
+                    template=(
+                        "{pkg_name} {current_version}"
+                        if current_version else
+                        (
+                            "{pkg_name} {new_version}"
+                            if new_version else
+                            "{pkg_name}"
+                        )
+                    ),
+                    pkg_name=pkg_name,
+                    current_version=current_version,
+                    new_version=new_version,
                 ),
-            )),
+            )
+        ),
     ))
     if ignored_from:
         message += f" {ignored_from}"
     print_stderr(message)
-
-
-def _get_local_version(package_name: str) -> str:
-    return PackageDB.get_local_dict()[package_name].version
-
-
-def print_package_uptodate(package_name: str, package_source: "PackageSource") -> None:
-    print_warning(
-        translate("{name} {version} {package_source} package is up to date - skipping").format(
-            name=package_name,
-            version=bold_line(_get_local_version(package_name)),
-            package_source=package_source.name,
-        ),
-    )
-
-
-def print_local_package_newer(package_name: str, aur_version: str) -> None:
-    print_warning(
-        translate(
-            "{name} {version} local package is newer than in AUR ({aur_version}) - skipping",
-        ).format(
-            name=package_name,
-            version=bold_line(_get_local_version(package_name)),
-            aur_version=bold_line(aur_version),
-        ),
-    )
-
-
-def print_package_downgrading(package_name: str, downgrade_version: str) -> None:
-    print_warning(
-        translate("Downgrading AUR package {name} {version} to {downgrade_version}").format(
-            name=bold_line(package_name),
-            version=bold_line(_get_local_version(package_name)),
-            downgrade_version=bold_line(downgrade_version),
-        ),
-    )
 
 
 def print_ignoring_outofdate_upgrade(package_info: InstallInfo) -> None:
@@ -680,8 +760,32 @@ def print_ignoring_outofdate_upgrade(package_info: InstallInfo) -> None:
     )
 
 
+def print_stable_version_upgrades(stable_versions_updates: dict[str, InstallInfo]) -> None:
+    print_warning(
+        translate("Stable versions of the following devel packages have newer versions:"),
+    )
+    for og_name, stable_version_update in sorted(
+            stable_versions_updates.items(), key=operator.itemgetter(0),
+    ):
+        line = f"    {bold_line(og_name)} ({stable_version_update.name})"
+        spacing = " " * (38 - printable_length(line))
+        print_stdout(
+            pretty_format_upgradeable(
+                [stable_version_update],
+                template=(
+                    f"{line}{spacing}"
+                    " {current_version}{spacing2}"
+                    "{version_separator}{new_version}{spacing3}"
+                    "{pkg_size}{days_old}{out_of_date}"
+                    "{required_by_installed}"
+                    "{verbose}"
+                ),
+            ),
+        )
+
+
 # pylint:disable=too-many-statements,too-many-branches
-def print_package_search_results(  # noqa: PLR0914,C901
+def print_package_search_results(  # noqa: C901
         repo_packages: "Iterable[pyalpm.Package]",
         aur_packages: "Iterable[AURPackageInfo]",
         local_pkgs_versions: dict[str, str],
@@ -690,7 +794,7 @@ def print_package_search_results(  # noqa: PLR0914,C901
         list_mode: bool = False,
 ) -> "list[AnyPackage]":
 
-    repos = [db.name for db in PackageDB.get_alpm_handle().get_syncdbs()]
+    repos = [db.name for db in PyAlpmWrapper.get_alpm_handle().get_syncdbs()]
     user_config = PikaurConfig()
     group_by_repo = user_config.ui.GroupByRepository.get_bool()
 

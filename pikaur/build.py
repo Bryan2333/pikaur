@@ -11,24 +11,13 @@ from typing import TYPE_CHECKING, ClassVar
 from .args import parse_args
 from .aur import find_aur_packages, get_repo_url
 from .config import (
+    DECORATION,
     AurReposCachePath,
     BuildCachePath,
     BuildDepsLockPath,
     PackageCachePath,
     PikaurConfig,
-)
-from .core import (
-    PIPE,
-    DataType,
-    chown_to_current,
-    dirname,
-    interactive_spawn,
-    joined_spawn,
-    mkdir,
-    open_file,
-    remove_dir,
-    replace_file,
-    spawn,
+    UsingDynamicUsers,
 )
 from .exceptions import (
     BuildError,
@@ -40,10 +29,18 @@ from .exceptions import (
 )
 from .filelock import FileLock
 from .i18n import translate, translate_many
-from .logging import create_logger
+from .logging_extras import create_logger
 from .makepkg_config import MakePkgCommand, MakepkgConfig, get_pkgdest
+from .os_utils import (
+    chown_to_current,
+    dirname,
+    mkdir,
+    open_file,
+    remove_dir,
+    replace_file,
+)
 from .pacman import PackageDB, get_pacman_command, install_built_deps
-from .pprint import (
+from .pikaprint import (
     ColorsHighlight,
     TTYRestoreContext,
     bold_line,
@@ -53,16 +50,22 @@ from .pprint import (
     print_stderr,
     print_stdout,
 )
+from .pikatypes import ComparableType
 from .privilege import (
     isolate_root_cmd,
     sudo,
-    using_dynamic_users,
 )
 from .prompt import (
     ask_to_continue,
     get_editor_or_exit,
     get_input,
     retry_interactive_command_or_exit,
+)
+from .spawn import (
+    PIPE,
+    interactive_spawn,
+    joined_spawn,
+    spawn,
 )
 from .srcinfo import SrcInfo
 from .updates import is_devel_pkg
@@ -73,8 +76,8 @@ if TYPE_CHECKING:
     from typing import Final
 
     from .args import PikaurArgs
-    from .core import InteractiveSpawn, SpawnArgs
     from .pacman import ProvidedDependency
+    from .spawn import InteractiveSpawn, SpawnArgs
 
 logger = create_logger("build")
 
@@ -124,13 +127,15 @@ def copy_aur_repo(from_path: Path, to_path: Path) -> None:
             raise RuntimeError(translate(f"Can't copy '{from_path}' to '{to_path}'."))
 
 
-class PackageBuild(DataType):  # noqa: PLR0904
+class PackageBuild(ComparableType):
     # pylint: disable=too-many-instance-attributes
-    clone = False
-    pull = False
+
+    clone: bool = False
+    pull: bool = False
 
     package_base: str
     package_names: list[str]
+    provides: list[str]
 
     repo_path: Path
     pkgbuild_path: Path
@@ -163,7 +168,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
             f"{self.package_names}>"
         )
 
-    def __init__(  # pylint: disable=super-init-not-called
+    def __init__(
             self,
             package_names: list[str] | None = None,
             pkgbuild_path: str | None = None,
@@ -180,13 +185,16 @@ class PackageBuild(DataType):  # noqa: PLR0904
             if pkgbase and srcinfo.pkgnames:
                 self.package_names = package_names or srcinfo.pkgnames
                 self.package_base = pkgbase
+                self.provides = srcinfo.get_values("provides")
             else:
                 no_pkgname_error = translate("Can't get package name from PKGBUILD")
                 raise BuildError(message=no_pkgname_error, build=self)
         elif package_names:
             self.package_names = package_names
-            self.package_base = find_aur_packages([package_names[0]])[0][0].packagebase
-            self.repo_path = AurReposCachePath()() / self.package_base
+            aur_pkg = find_aur_packages([package_names[0]])[0][0]
+            self.package_base = aur_pkg.packagebase
+            self.provides = aur_pkg.provides
+            self.repo_path = AurReposCachePath() / self.package_base
             self.pkgbuild_path = self.repo_path / DEFAULT_PKGBUILD_BASENAME
         else:
             missing_property_error = translate(
@@ -197,7 +205,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
             )
             raise NotImplementedError(missing_property_error)
 
-        self.build_dir = BuildCachePath()() / self.package_base
+        self.build_dir = BuildCachePath() / self.package_base
         logger.debug("Build dir: {}", self.build_dir)
         self.build_gpgdir = self.args.build_gpgdir
         self.built_packages_paths = {}
@@ -327,7 +335,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
             bold_line(", ".join(self.package_names)),
         )
         print_stdout(
-            f"{color_line('::', ColorsHighlight.white)} {message}...",
+            f"{color_line(DECORATION, ColorsHighlight.white)} {message}...",
             tty_restore=tty_restore,
         )
         pkgver_result = joined_spawn(
@@ -350,7 +358,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
                 answer = translate("a")
             else:  # pragma: no cover
                 prompt = "{} {}\n{}\n> ".format(
-                    color_line("::", ColorsHighlight.yellow),
+                    color_line(DECORATION, ColorsHighlight.yellow),
                     translate("Try recovering?"),
                     "\n".join((
                         translate("[R] retry clone"),
@@ -434,8 +442,10 @@ class PackageBuild(DataType):  # noqa: PLR0904
             self,
             all_package_builds: dict[str, "PackageBuild"],
     ) -> None:
+        logger.debug("<< _FILTER_BUILT_DEPS")
 
         def _mark_dep_resolved(dep: str) -> None:
+            logger.debug("  _mark_dep_resolved: {}", dep)
             if dep in self.new_make_deps_to_install:
                 self.new_make_deps_to_install.remove(dep)
             if dep in self.new_deps_to_install:
@@ -447,29 +457,44 @@ class PackageBuild(DataType):  # noqa: PLR0904
                 srcinfo = SrcInfo(
                     pkgbuild_path=pkg_build.pkgbuild_path, package_name=pkg_name,
                 )
+                stripped_pkg_name = VersionMatcher(pkg_name).pkg_name
                 all_provided_pkgnames.update(
-                    dict.fromkeys([pkg_name, *srcinfo.get_values("provides")], pkg_name),
+                    dict.fromkeys(
+                        [stripped_pkg_name, *(
+                            VersionMatcher(name).pkg_name
+                            for name in srcinfo.get_values("provides")
+                        )],
+                        stripped_pkg_name,
+                    ),
                 )
 
         self.built_deps_to_install = {}
 
+        logger.debug("  self.all_deps_to_install={}", self.all_deps_to_install)
+        logger.debug("  all_provided_pkgnames={}", all_provided_pkgnames)
         for dep in self.all_deps_to_install:
             dep_name = VersionMatcher(dep).pkg_name
+            logger.debug("    {} {}", dep, dep_name)
             if dep_name not in all_provided_pkgnames:
                 continue
             package_build = all_package_builds[all_provided_pkgnames[dep_name]]
+            logger.debug("    {} {}", package_build, all_provided_pkgnames[dep_name])
             if package_build == self:
                 _mark_dep_resolved(dep)
                 continue
             for pkg_name in package_build.package_names:
+                logger.debug("      {}", pkg_name)
                 if package_build.failed:
                     self.failed = True
+                    logger.debug("      FAILED")
                     raise DependencyError
                 if not package_build.built_packages_paths.get(pkg_name):
+                    logger.debug("      NOT_BUILT: {}", package_build.built_packages_paths)
                     raise DependencyNotBuiltYetError
                 self.built_deps_to_install[pkg_name] = \
                     package_build.built_packages_paths[pkg_name]
                 _mark_dep_resolved(dep)
+        logger.debug(">> _FILTER_BUILT_DEPS")
 
     def _get_pacman_command(self, ignore_args: list[str] | None = None) -> list[str]:
         return get_pacman_command(ignore_args=ignore_args) + (
@@ -488,7 +513,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
         message = translate("Installing already built dependencies for {}").format(
             bold_line(", ".join(self.package_names)),
         )
-        print_stderr(f"{color_line('::', ColorsHighlight.purple)} {message}:")
+        print_stderr(f"{color_line(DECORATION, ColorsHighlight.purple)} {message}:")
 
         try:
             update_self_deps = False
@@ -508,7 +533,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
         finally:
             PackageDB.discard_local_cache()
 
-    def _set_built_package_path(self) -> None:
+    def set_built_package_path(self) -> None:  # pylint: disable=too-many-branches
         pkg_paths_spawn = spawn(
             isolate_root_cmd(
                 [*MakePkgCommand.get(), "--packagelist"],
@@ -521,7 +546,14 @@ class PackageBuild(DataType):  # noqa: PLR0904
         if not pkg_paths_spawn.stdout_text:
             return
         logger.debug("Package names: {}", pkg_paths_spawn)
-        pkg_paths = [Path(line) for line in pkg_paths_spawn.stdout_text.splitlines()]
+        pkg_paths: list[Path] = []
+        debug_pkg_paths: list[Path] = []
+        for line in pkg_paths_spawn.stdout_text.splitlines():
+            for pkg_name in self.package_names:
+                if f"{pkg_name}-debug-" in line:
+                    debug_pkg_paths.append(Path(line))
+                elif pkg_name in line:
+                    pkg_paths.append(Path(line))
         if not pkg_paths:
             return
         pkg_dest = get_pkgdest()
@@ -546,7 +578,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
                 ) / pkg_path
                 logger.debug("Resolving full path: {} from base path: {}", pkg_path, pkg_basename)
             new_package_path = (
-                Path(pkg_dest) if pkg_dest else PackageCachePath()()
+                Path(pkg_dest) if pkg_dest else PackageCachePath()
             ) / pkg_basename
             logger.debug("New package path: {}", new_package_path)
             if not pkg_dest or MakePkgCommand.pkgdest_skipped:
@@ -554,16 +586,27 @@ class PackageBuild(DataType):  # noqa: PLR0904
                 new_package_sig_path = new_package_path.parent / (
                     new_package_path.name + ".sig"
                 )
-                mkdir(PackageCachePath()())
-                replace_file(pkg_path, new_package_path)
-                replace_file(pkg_sig_path, new_package_sig_path)
+                mkdir(PackageCachePath())
+                for path_from, path_to in (
+                    (pkg_path, new_package_path),
+                    (pkg_sig_path, new_package_sig_path),
+                ):
+                    if path_from.exists():
+                        logger.debug("Copying {} to {}", path_from, path_to)
+                        replace_file(path_from, path_to)
+                logger.debug("Found debug packages: {}", debug_pkg_paths)
+                for debug_pkg_path in debug_pkg_paths:
+                    new_debug_pkg_path = new_package_path.parent / debug_pkg_path.name
+                    if debug_pkg_path.exists():
+                        logger.debug("Copying {} to {}", debug_pkg_path, new_debug_pkg_path)
+                        replace_file(debug_pkg_path, new_debug_pkg_path)
             pkg_path = new_package_path
             if pkg_path and pkg_path.exists():
                 self.built_packages_paths[pkg_name] = pkg_path
 
     def check_if_already_built(self) -> bool:
         self.get_latest_dev_sources()
-        self._set_built_package_path()
+        self.set_built_package_path()
         if (
                 not self.args.rebuild and
                 len(self.built_packages_paths) == len(self.package_names)
@@ -575,7 +618,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
             ).format(
                 pkg=bold_line(", ".join(self.package_names)),
             )
-            print_stderr(f"{color_line('::', ColorsHighlight.green)} {message}\n")
+            print_stderr(f"{color_line(DECORATION, ColorsHighlight.green)} {message}\n")
             return True
         return False
 
@@ -647,7 +690,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
         message = translate("Installing repository dependencies for {}").format(
             bold_line(", ".join(self.package_names)),
         )
-        print_stderr(f"{color_line('::', ColorsHighlight.purple)} {message}:")
+        print_stderr(f"{color_line(DECORATION, ColorsHighlight.purple)} {message}:")
 
         # @TODO: add support for --skip-failed-build here:
         retry_interactive_command_or_exit(
@@ -659,20 +702,23 @@ class PackageBuild(DataType):  # noqa: PLR0904
             pikspect=True,
             conflicts=self.resolved_conflicts,
         )
-        PackageDB.discard_local_cache()
-        self._local_pkgs_with_build_deps = set(PackageDB.get_local_dict().keys())
-        self._local_provided_pkgs_with_build_deps = PackageDB.get_local_provided_dict()
 
     def install_all_deps(self, all_package_builds: dict[str, "PackageBuild"]) -> None:
-        with FileLock(BuildDepsLockPath()()):
+        with FileLock(BuildDepsLockPath()):
             self.get_deps(all_package_builds)
             if self.all_deps_to_install or self.built_deps_to_install:
                 PackageDB.discard_local_cache()
                 self._local_pkgs_wo_build_deps = set(PackageDB.get_local_dict().keys())
             self.install_built_deps(all_package_builds)
             self._install_repo_deps()
+            PackageDB.discard_local_cache()
+            self._local_pkgs_with_build_deps = set(PackageDB.get_local_dict().keys())
+            self._local_provided_pkgs_with_build_deps = PackageDB.get_local_provided_dict()
 
     def _remove_installed_deps(self) -> None:
+        # logger.debug(
+        #     "Local pkgs before installing build deps: {}", self._local_pkgs_wo_build_deps,
+        # )
         if not self._local_pkgs_wo_build_deps:
             return
 
@@ -720,7 +766,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
         message = translate("Removing already installed dependencies for {}").format(
             bold_line(", ".join(self.package_names)),
         )
-        print_stderr(f"{color_line('::', ColorsHighlight.purple)} {message}:")
+        print_stderr(f"{color_line(DECORATION, ColorsHighlight.purple)} {message}:")
         retry_interactive_command_or_exit(
             sudo(
                 # pacman --remove flag conflicts with some --sync options:
@@ -819,7 +865,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
 
         message = translate("Starting the build")
         print_stderr(
-            f"\n{color_line('::', ColorsHighlight.purple)} {message}:",
+            f"\n{color_line(DECORATION, ColorsHighlight.purple)} {message}:",
         )
         build_succeeded = False
         skip_pgp_check = False
@@ -853,7 +899,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
                 answer = translate("a")
             else:  # pragma: no cover
                 prompt = "{} {}\n{}\n> ".format(
-                    color_line("::", ColorsHighlight.yellow),
+                    color_line(DECORATION, ColorsHighlight.yellow),
                     translate("Try recovering?"),
                     "\n".join((
                         translate("[R] retry build"),
@@ -951,7 +997,7 @@ class PackageBuild(DataType):  # noqa: PLR0904
         if not build_succeeded:
             self.failed = True
             raise BuildError(message="failed to build", build=self)
-        self._set_built_package_path()
+        self.set_built_package_path()
 
 
 class AlreadyClonedRepos:
@@ -973,7 +1019,7 @@ def clone_aur_repos(package_names: list[str]) -> dict[str, PackageBuild]:
     for aur_pkg in aur_pkgs:
         packages_bases.setdefault(aur_pkg.packagebase, []).append(aur_pkg.name)
     package_builds_by_base = {
-        pkgbase: PackageBuild(pkg_names)
+        pkgbase: PackageBuild(package_names=pkg_names)
         for pkgbase, pkg_names in packages_bases.items()
         if not AlreadyClonedRepos.get(pkgbase)
     }
@@ -981,7 +1027,7 @@ def clone_aur_repos(package_names: list[str]) -> dict[str, PackageBuild]:
     pool_size: int | None = None
     if clone_c := parse_args().aur_clone_concurrency:
         pool_size = clone_c
-    elif using_dynamic_users():
+    elif UsingDynamicUsers():
         pool_size = 1
     exc: CloneError | None = None
     with (
@@ -1007,7 +1053,7 @@ def clone_aur_repos(package_names: list[str]) -> dict[str, PackageBuild]:
         raise exc
 
     all_package_builds_by_base = {
-        pkgbase: PackageBuild(pkg_names)
+        pkgbase: PackageBuild(package_names=pkg_names)
         for pkgbase, pkg_names in packages_bases.items()
     }
     return {

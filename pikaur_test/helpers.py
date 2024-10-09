@@ -14,12 +14,13 @@ from unittest.runner import TextTestResult
 from pycman.config import PacmanConfig
 
 from pikaur.args import CachedArgs, parse_args
-from pikaur.core import InteractiveSpawn
-from pikaur.core import spawn as core_spawn
+from pikaur.config import DEFAULT_INPUT_ENCODING
 from pikaur.main import main
 from pikaur.makepkg_config import MakePkgCommand
 from pikaur.pacman import PackageDB
-from pikaur.pprint import color_line, get_term_width
+from pikaur.pikaprint import color_line, get_term_width
+from pikaur.spawn import InteractiveSpawn
+from pikaur.spawn import spawn as core_spawn
 from pikaur.srcinfo import SrcInfo
 
 if TYPE_CHECKING:
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
     from unittest import TestResult
 
 
-WRITE_DB = bool(os.environ.get("WRITE_DB"))
+WRITE_DB: bool = bool(os.environ.get("WRITE_DB"))
 
 
 if WRITE_DB:
@@ -38,7 +39,7 @@ if WRITE_DB:
 
     from pikaur.config import ConfigPath, PikaurConfig
 
-    CONFIG_PATH = ConfigPath()()
+    CONFIG_PATH = ConfigPath()
     if CONFIG_PATH.exists():
         shutil.copy(CONFIG_PATH, f"{CONFIG_PATH}.pikaur_test_bak")
         CONFIG_PATH.unlink()
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
     from mypy_extensions import DefaultArg
 
 
-TEST_DIR = Path(os.path.realpath(__file__)).parent
+TEST_DIR: Path = Path(os.path.realpath(__file__)).parent
 
 
 def spawn(cmd: str | list[str], env: dict[str, str] | None = None) -> InteractiveSpawn:
@@ -123,8 +124,8 @@ class InterceptSysOutput:
         self.capture_stdout = capture_stdout
         self.capture_stderr = capture_stderr
 
-        self.out_file = out_file = tempfile.TemporaryFile("w+", encoding="UTF-8")
-        self.err_file = err_file = tempfile.TemporaryFile("w+", encoding="UTF-8")
+        self.out_file = out_file = tempfile.TemporaryFile("w+", encoding="UTF-8")  # noqa: SIM115
+        self.err_file = err_file = tempfile.TemporaryFile("w+", encoding="UTF-8")  # noqa: SIM115
         self.out_file.isatty = lambda: False  # type: ignore[method-assign]
         self.err_file.isatty = lambda: False  # type: ignore[method-assign]
 
@@ -139,7 +140,7 @@ class InterceptSysOutput:
         if self.capture_stderr:
             self._patcher_stderr = mock.patch("sys.stderr", new=self.err_file)
         self._patcher_exit = mock.patch("sys.exit", new=self._fake_exit)
-        self._patcher_spawn = mock.patch("pikaur.core.InteractiveSpawn", new=PrintInteractiveSpawn)
+        self._patcher_spawn = mock.patch("pikaur.spawn.InteractiveSpawn", new=PrintInteractiveSpawn)
 
         self.patchers = [
             self._patcher_stdout,
@@ -181,7 +182,7 @@ def pikaur(
         *,
         capture_stdout: bool = True, capture_stderr: bool = False,
         fake_makepkg: bool = False, skippgpcheck: bool = False,
-        print_on_fails: bool = True,
+        print_on_fails: bool = True, fake_makepkg_noextract: bool = True,
 ) -> CmdResult:
 
     PackageDB.discard_local_cache()
@@ -201,7 +202,8 @@ def pikaur(
         new_args += [
             "--makepkg-path=" + str(TEST_DIR / "fake_makepkg"),
         ]
-        mflags.append("--noextract")
+        if fake_makepkg_noextract:
+            mflags.append("--noextract")
     if skippgpcheck:
         mflags.append("--skippgpcheck")
     if "--mflags" in cmd:
@@ -282,7 +284,12 @@ class PikaurTestCase(TestCase):
         time_started = time()
         log_stderr(self.separator)
         result = super().run(result)
-        log_stderr(f":: Took {(time() - time_started):.2f} seconds")
+        # print(result and result.collectedDurations)
+        time_spent = time() - time_started
+        log_stderr(f":: Took {(time_spent):.2f} seconds")
+        if test_times_path := os.environ.get("TEST_TIMES_PATH"):
+            with Path(test_times_path).open("a", encoding=DEFAULT_INPUT_ENCODING) as fobj:
+                fobj.write(f"{(time_spent):.2f} {self}\n")
         return result
 
     def setUp(self) -> None:

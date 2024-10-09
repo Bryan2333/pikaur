@@ -8,14 +8,11 @@ from typing import TYPE_CHECKING
 
 from .args import LiteralArgs, parse_args
 from .config import PikaurConfig, PromptLockPath
-from .core import InteractiveSpawn, interactive_spawn
 from .exceptions import SysExit
 from .filelock import FileLock
 from .i18n import translate
-from .logging import create_logger
-from .pikspect import PikspectPopen, ReadlineKeycodes, TTYInputWrapper
-from .pikspect import pikspect as pikspect_spawn
-from .pprint import (
+from .logging_extras import create_logger
+from .pikaprint import (
     ColorsHighlight,
     TTYRestoreContext,
     color_line,
@@ -24,7 +21,10 @@ from .pprint import (
     print_warning,
     range_printable,
 )
+from .pikspect import PikspectPopen, ReadlineKeycodes, TTYInputWrapper
+from .pikspect import pikspect as pikspect_spawn
 from .privilege import isolate_root_cmd
+from .spawn import InteractiveSpawn, interactive_spawn
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -120,7 +120,7 @@ def get_input(
     logger.debug("Gonna get input from user...")
     answer = ""
     with (
-            FileLock(PromptLockPath()()),
+            FileLock(PromptLockPath()),
             TTYInputWrapper(),
             TTYRestoreContext(before=True, after=True),
     ):
@@ -160,7 +160,7 @@ class NumberRangeInputSyntax:
     RANGES: "Final[Sequence[str]]" = ("-", "..")
 
 
-def get_multiple_numbers_input(prompt: str, answers: "Iterable[int]" = ()) -> list[int]:
+def get_multiple_numbers_input(prompt: str = "> ", answers: "Iterable[int]" = ()) -> list[int]:
     str_result = get_input(prompt, [str(answer) for answer in answers], require_confirm=True)
     if not str_result:
         return []

@@ -23,8 +23,10 @@ class RegressionTest(PikaurDbTestCase):
 
     def test_double_requirements_aur(self):
         # with doubled aur dep
-        # python-xdis>=5.0.4, python-xdis<5.1.0
-        pkg_name = "python-uncompyle6"
+        # pikaur_meta_helpers/find_aur_pkgs_with_double_requirements.py
+        # python-prompt_toolkit>3.0.41, python-prompt_toolkit<3.1,
+        # python-rchitect>=0.4.6, python-rchitect<0.5.0
+        pkg_name = "radian"
 
         fake_pikaur(f"-S {pkg_name}")
         # pikaur(f"-S {pkg_name}")

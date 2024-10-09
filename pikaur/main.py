@@ -16,21 +16,18 @@ from typing import TYPE_CHECKING
 
 import pyalpm
 
+from . import extras
 from .args import parse_args
 from .config import (
+    DEFAULT_INPUT_ENCODING,
     AurReposCachePath,
     CacheRoot,
     DataRoot,
     PikaurConfig,
+    RunningAsRoot,
+    UsingDynamicUsers,
     _OldAurReposCachePath,
     _UserCacheRoot,
-)
-from .core import (
-    DEFAULT_INPUT_ENCODING,
-    check_runtime_deps,
-    interactive_spawn,
-    mkdir,
-    spawn,
 )
 from .exceptions import SysExit
 from .getpkgbuild_cli import cli_getpkgbuild
@@ -38,23 +35,32 @@ from .help_cli import cli_print_help
 from .i18n import translate
 from .info_cli import cli_info_packages
 from .install_cli import InstallPackagesCLI
-from .logging import create_logger
+from .logging_extras import create_logger
+from .os_utils import (
+    check_executables,
+    mkdir,
+)
+from .pacman import PackageDB
+from .pikaprint import TTYRestore, bold_line, print_error, print_stderr, print_warning
+from .pikatypes import AURPackageInfo
 from .pikspect import PikspectSignalHandler
 from .pkg_cache_cli import cli_clean_packages_cache
-from .pprint import TTYRestore, print_error, print_stderr, print_warning
 from .print_department import print_version
 from .privilege import (
     get_args_to_elevate_pikaur,
     isolate_root_cmd,
     need_dynamic_users,
-    running_as_root,
     sudo,
-    using_dynamic_users,
 )
 from .prompt import NotANumberInputError, get_multiple_numbers_input
 from .search_cli import cli_search_packages, search_packages
+from .spawn import (
+    interactive_spawn,
+    spawn,
+)
 from .updates import print_upgradeable
 from .urllib_helper import ProxyInitSocks5Error, init_proxy
+from .version import split_version
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -63,6 +69,9 @@ if TYPE_CHECKING:
 
 
 def init_readline() -> None:
+    if not getattr(readline, "read_init_file", None):
+        print_warning("Can't init readline")
+        return
     # follow GNU readline config in prompts:
     system_inputrc_path = Path("/etc/inputrc")
     if system_inputrc_path.exists():
@@ -74,6 +83,7 @@ def init_readline() -> None:
 
 init_readline()
 
+SYSTEMD_MIN_VERSION: "Final" = 235
 logger = create_logger(f"main_{os.getuid()}")
 
 
@@ -110,7 +120,7 @@ class OutputEncodingWrapper(AbstractContextManager[None]):
                 )
                 setattr(
                     sys, attr,
-                    open(  # noqa: SIM115
+                    open(
                         real_stream.fileno(),
                         mode="w",
                         encoding=DEFAULT_INPUT_ENCODING,
@@ -172,7 +182,7 @@ def cli_pkgbuild() -> None:
 def cli_print_version() -> None:
     args = parse_args()
     proc = spawn([
-        PikaurConfig().misc.PacmanPath.get_str(), "--version",
+        args.pacman_path, "--version",
     ])
     pacman_version = proc.stdout_text.splitlines()[1].strip(" .-") if proc.stdout_text else "N/A"
     print_version(
@@ -194,7 +204,7 @@ def cli_dynamic_select() -> None:  # pragma: no cover
                     "and press [Enter] (default={}):",
                 ).format(1),
             )
-            answers = get_multiple_numbers_input("> ", list(range(1, len(packages) + 1))) or [1]
+            answers = get_multiple_numbers_input(answers=list(range(1, len(packages) + 1))) or [1]
             print_stderr()
             selected_pkgs_idx = [idx - 1 for idx in answers]
             restart_prompt = False
@@ -212,28 +222,43 @@ def cli_dynamic_select() -> None:  # pragma: no cover
                 raise SysExit(128) from exc
             print_error(translate("invalid number: {}").format(exc.character))
 
-    parse_args().positional = [packages[idx].name for idx in selected_pkgs_idx]
-    cli_install_packages()
+    new_args = [*sys.argv]
+    for positional in parse_args().positional:
+        new_args.remove(positional)
+    new_args += ["--sync"]
+    for idx in selected_pkgs_idx:
+        pkg = packages[idx]
+        repo = "aur" if isinstance(pkg, AURPackageInfo) else pkg.db.name
+        new_args += [f"{repo}/{pkg.name}"]
+    execute_pikaur_operation(
+        pikaur_operation=cli_install_packages,
+        require_sudo=True,
+        replace_args=new_args,
+    )
 
 
 def execute_pikaur_operation(
         pikaur_operation: "Callable[[], None]",
         *,
         require_sudo: bool,
+        replace_args: None | list[str] = None,
 ) -> None:
     args = parse_args()
-    logger.debug("Pikaur operation found for args {}: {}", sys.argv, pikaur_operation.__name__)
+    cli_args = replace_args or sys.argv
+    logger.debug("Pikaur operation found for args {}: {}", cli_args, pikaur_operation.__name__)
     if args.read_stdin:
         logger.debug("Handling stdin as positional args:")
         logger.debug("    {}", args.positional)
-        args.positional += [
+        add_args = [
             word
             for line in sys.stdin.readlines()
             for word in line.split()
         ]
-        logger.debug("    {}", args.positional)
+        logger.debug("    {}", add_args)
+        args.positional += add_args
+        cli_args += add_args
     if (
-            running_as_root()
+            RunningAsRoot()
             and (PikaurConfig().build.DynamicUsers.get_str() == "never" and not args.user_id)
     ):
         print_error(
@@ -245,7 +270,7 @@ def execute_pikaur_operation(
         sys.exit(1)
     elif (
             require_sudo
-            and not running_as_root()
+            and not RunningAsRoot()
             and (
                 args.privilege_escalation_target == "pikaur"
                 or need_dynamic_users()
@@ -253,11 +278,24 @@ def execute_pikaur_operation(
     ):
         # Restart pikaur with sudo to use systemd dynamic users or current user id
         sys.exit(interactive_spawn(
-            get_args_to_elevate_pikaur(sys.argv),
+            get_args_to_elevate_pikaur(cli_args),
         ).returncode)
     else:
         # Just run the operation normally
         pikaur_operation()
+
+
+def cli_extras() -> None:
+    args = parse_args()
+    if args.dep_tree:
+        if not args.positional:
+            print_error(translate("no package(s) specified"))
+        for pkg in args.positional:
+            extras.dep_tree.cli(
+                pkgname=pkg, max_level=args.level, description=not args.quiet,
+            )
+    else:
+        cli_print_help()
 
 
 def cli_entry_point() -> None:  # pylint: disable=too-many-statements
@@ -297,6 +335,9 @@ def cli_entry_point() -> None:  # pylint: disable=too-many-statements
         require_sudo = True
         pikaur_operation = cli_pkgbuild
 
+    elif args.extras:
+        pikaur_operation = cli_extras
+
     elif args.sync:
         if args.search or args.list:
             pikaur_operation = cli_search_packages
@@ -313,7 +354,6 @@ def cli_entry_point() -> None:  # pylint: disable=too-many-statements
             pikaur_operation = cli_install_packages
 
     elif args.interactive_package_select:
-        require_sudo = True
         pikaur_operation = cli_dynamic_select
 
     else:
@@ -325,7 +365,7 @@ def cli_entry_point() -> None:  # pylint: disable=too-many-statements
         # Just bypass all the args to pacman
         logger.debug("Pikaur operation not found for args: {}", sys.argv)
         logger.debug(args)
-        pacman_args = [PikaurConfig().misc.PacmanPath.get_str(), *args.raw_without_pikaur_specific]
+        pacman_args = [args.pacman_path, *args.raw_without_pikaur_specific]
         if require_sudo:
             pacman_args = sudo(pacman_args)
         sys.exit(
@@ -334,13 +374,13 @@ def cli_entry_point() -> None:  # pylint: disable=too-many-statements
 
 
 def migrate_old_aur_repos_dir() -> None:
-    old_aur_repos_cache_path = _OldAurReposCachePath()()
-    new_aur_repos_cache_path = AurReposCachePath()()
+    old_aur_repos_cache_path = _OldAurReposCachePath()
+    new_aur_repos_cache_path = AurReposCachePath()
     if not (
             old_aur_repos_cache_path.exists() and not new_aur_repos_cache_path.exists()
     ):
         return
-    mkdir(DataRoot()())
+    mkdir(DataRoot())
     shutil.move(old_aur_repos_cache_path, new_aur_repos_cache_path)
 
     print_stderr()
@@ -356,7 +396,7 @@ def migrate_old_aur_repos_dir() -> None:
 
 
 def create_dirs() -> None:
-    if using_dynamic_users():
+    if UsingDynamicUsers():
         # Let systemd-run setup the directories and symlinks
         true_cmd = isolate_root_cmd(["true"])
         result = spawn(true_cmd)
@@ -364,11 +404,11 @@ def create_dirs() -> None:
             raise RuntimeError(result)
         # Chown the private CacheDirectory to root to signal systemd that
         # it needs to recursively chown it to the correct user
-        os.chown(os.path.realpath(CacheRoot()()), 0, 0)
-        mkdir(_UserCacheRoot()())
-    mkdir(CacheRoot()())
+        os.chown(os.path.realpath(CacheRoot()), 0, 0)
+        mkdir(_UserCacheRoot())
+    mkdir(CacheRoot())
     migrate_old_aur_repos_dir()
-    mkdir(AurReposCachePath()())
+    mkdir(AurReposCachePath())
 
 
 def restore_tty() -> None:
@@ -400,6 +440,74 @@ class EmptyWrapper:
 
     def __exit__(self, *_exc_details: object) -> None:
         pass
+
+
+def check_systemd_dynamic_users_version() -> bool:  # pragma: no cover
+    # @TODO: remove this check later as systemd v 235 is quite OLD already
+    pkg = PackageDB.get_local_pkg_uncached("systemd")
+    if not pkg:
+        return False
+    check_executables(["systemd-run"])
+    version = int(split_version(pkg.version)[0])
+    return version >= SYSTEMD_MIN_VERSION
+
+
+def check_runtime_deps() -> None:
+    if sys.version_info < (3, 7):
+        print_error(
+            translate("pikaur requires Python >= 3.7 to run."),
+        )
+        sys.exit(65)
+    if (
+        (PikaurConfig().build.DynamicUsers.get_str() != "never" and not parse_args().user_id)
+        and (UsingDynamicUsers() and not check_systemd_dynamic_users_version())
+    ):
+        print_error(
+            translate("pikaur requires systemd >= 235 (dynamic users) to be run as root."),
+        )
+        sys.exit(65)
+    privilege_escalation_tool = PikaurConfig().misc.PrivilegeEscalationTool.get_str()
+    if not PackageDB.get_local_pkg_uncached("base-devel"):
+        warn_about_non_sudo \
+            = PikaurConfig().ui.WarnAboutNonDefaultPrivilegeEscalationTool.get_bool()
+        if warn_about_non_sudo or privilege_escalation_tool == "sudo":
+            print_stderr()
+            print_warning(
+                "\n".join([
+                    "",
+                    translate(
+                        "".join([  # grep -v grep 😸
+                            chr(ord(c) - 1)
+                            for c in
+                            "Sfbe!ebno!bsdi.xjlj!cfgpsf!cpsljoh!zpvs!dpnqvufs;"
+                        ]),
+                    ),
+                    bold_line(
+                        "".join([
+                            chr(ord(c) - 1)
+                            for c in
+                            "iuuqt;00xjlj/bsdimjovy/psh0ujumf0Bsdi`Vtfs`Sfqptjupsz"
+                        ]),
+                    ),
+                    translate(
+                        "".join([
+                            chr(ord(c) - 1)
+                            for c in
+                            ")Bmtp-!epo(u!sfqpsu!boz!jttvft!up!qjlbvs-!jg!vsf!tffjoh!uijt!nfttbhf*"
+                        ]),
+                    ),
+                    "",
+                ] if privilege_escalation_tool == "sudo" else [
+                    "",
+                    translate(
+                        "{privilege_escalation_tool} is not part of minimal Arch default setup,"
+                        " be aware that you could run into potential problems.",
+                    ).format(privilege_escalation_tool=privilege_escalation_tool),
+                    "",
+                ]),
+            )
+    if not RunningAsRoot():
+        check_executables([privilege_escalation_tool])
 
 
 def main(*, embed: bool = False) -> None:

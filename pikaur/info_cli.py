@@ -4,11 +4,21 @@ from unicodedata import east_asian_width
 
 from .args import parse_args, reconstruct_args
 from .aur import find_aur_packages, get_all_aur_names
-from .core import DEFAULT_TIMEZONE, spawn
+from .config import DEFAULT_TIMEZONE
 from .i18n import translate
 from .pacman import get_pacman_command, refresh_pkg_db_if_needed
 from .pacman_i18n import _p
-from .pprint import ColorsHighlight, bold_line, color_line, print_stdout
+from .pikaprint import (
+    ColorsHighlight,
+    bold_line,
+    color_line,
+    format_paragraph,
+    get_term_width,
+    print_stdout,
+    printable_length,
+    sidejoin_multiline_paragraphs,
+)
+from .spawn import spawn
 
 
 def _info_packages_thread_repo() -> str | None:
@@ -22,6 +32,7 @@ def _info_packages_thread_repo() -> str | None:
 def get_info_fields() -> dict[str, str]:
     return {
         "git_url": translate("AUR Git URL"),
+        "web_url": translate("AUR Web URL"),
         # "aur_id": translate("id"),
         "name": translate("Name"),
         # packagebaseid=translate(""),
@@ -81,6 +92,7 @@ def cli_info_packages() -> None:
     aur_pkgs = aur_result[0]
     num_found = len(aur_pkgs)
     info_fields = get_info_fields()
+    term_width = get_term_width()
     longest_field_length = max(len(field) for field in info_fields.values())
     for i, aur_pkg in enumerate(aur_pkgs):
         pkg_info_lines = []
@@ -89,9 +101,23 @@ def cli_info_packages() -> None:
             if key in {"firstsubmitted", "lastmodified", "outofdate"} and value:
                 value = datetime.fromtimestamp(value, tz=DEFAULT_TIMEZONE).strftime("%c")
             elif isinstance(value, list):
-                value = ", ".join(value) or translate("None")
-            key_display = bold_line(_rightpad(display_name, longest_field_length + 1))
-            pkg_info_lines.append(f"{key_display}: {value}")
+                value = "  ".join(value) or translate("None")
+            key_display = bold_line(_rightpad(display_name, longest_field_length + 1) + ": ")
+            if not isinstance(value, str):
+                value = str(value)
+            line = f"{key_display}{value}"
+            if printable_length(line) > term_width:
+                value_display = format_paragraph(
+                    value, width=term_width - longest_field_length - 2 - 1, padding=0,
+                )
+                line = sidejoin_multiline_paragraphs(
+                    "", (
+                        key_display,
+                        value_display,
+                    ),
+                    auto_column=True,
+                )
+            pkg_info_lines.append(line)
         print_stdout(
             _decorate_aur_info_output("\n".join(pkg_info_lines)) +
             ("\n" if i + 1 < num_found else ""),

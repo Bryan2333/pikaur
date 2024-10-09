@@ -3,44 +3,55 @@
 import sys
 from argparse import Namespace
 from pprint import pformat
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple, cast
 
-from .argparse import ArgumentParserWithUnknowns
-from .config import PikaurConfig
-from .i18n import translate, translate_many
+from .argparse_extras import ArgumentParserWithUnknowns
+from .config import DECORATION, PikaurConfig
+from .i18n import PIKAUR_NAME, translate, translate_many
 
 if TYPE_CHECKING:
     from argparse import FileType
     from collections.abc import Callable
     from typing import Any, Final, NoReturn
 
-ArgValue = None | bool | str | int
-ArgSchema = list[
-    tuple[str, str, ArgValue, str | None]
-    | tuple[None, str, ArgValue, str | None]
-    | tuple[str, None, ArgValue, str | None]
-]
 PossibleArgValuesTypes = list[str] | str | bool | int | None
-HelpMessage = tuple[str | None, str | None, str | None]
+
+
+class Arg(NamedTuple):
+    short: str | None
+    long: str | None
+    default: PossibleArgValuesTypes
+    doc: str | None
+    help_only: bool = False
+
+
+ArgSchema = list[Arg]
+
+
+class HelpMessage(NamedTuple):
+    short: str | None
+    long: str | None
+    doc: str | None
 
 
 PACMAN_ACTIONS: "Final[ArgSchema]" = [
-    ("S", "sync", None, None),
-    ("Q", "query", None, None),
-    ("D", "database", None, None),
-    ("F", "files", None, None),
-    ("R", "remove", None, None),
-    ("T", "deptest", None, None),
-    ("U", "upgrade", None, None),
-    ("V", "version", None, None),
-    ("h", "help", None, None),
+    Arg("S", "sync", None, None),
+    Arg("Q", "query", None, None),
+    Arg("D", "database", None, None),
+    Arg("F", "files", None, None),
+    Arg("R", "remove", None, None),
+    Arg("T", "deptest", None, None),
+    Arg("U", "upgrade", None, None),
+    Arg("V", "version", None, None),
+    Arg("h", "help", None, None),
 ]
 
 
 PIKAUR_ACTIONS: "Final[ArgSchema]" = [
-    ("P", "pkgbuild", None, None),
-    ("G", "getpkgbuild", None, None),
-    (None, "interactive_package_select", None, None),
+    Arg("P", "pkgbuild", None, None),
+    Arg("G", "getpkgbuild", None, None),
+    Arg("X", "extras", None, None),
+    Arg(None, "interactive_package_select", None, None),
 ]
 
 
@@ -53,6 +64,7 @@ ALL_PIKAUR_ACTIONS: "Final[list[str]]" = [
     if schema[1] is not None
 ]
 ALL_ACTIONS: "Final[list[str]]" = ALL_PACMAN_ACTIONS + ALL_PIKAUR_ACTIONS
+LIST_ALL_ACTIONS: "Final[str]" = "_ALL_"
 
 
 def print_stderr(msg: str | None = None) -> None:
@@ -61,6 +73,16 @@ def print_stderr(msg: str | None = None) -> None:
 
 def pprint_stderr(msg: "Any") -> None:
     print_stderr(pformat(msg))
+
+
+def print_error(message: str = "") -> None:
+    print_stderr(
+        " ".join((
+            DECORATION,
+            translate("error:"),
+            message,
+        )),
+    )
 
 
 FLAG_READ_STDIN: "Final" = "-"
@@ -72,157 +94,179 @@ class LiteralArgs:
 
 
 def get_pacman_bool_opts(action: str | None = None) -> ArgSchema:
-    if not action:
+    if action == LIST_ALL_ACTIONS:
         result = []
         for each_action in ALL_PACMAN_ACTIONS:
             result += get_pacman_bool_opts(each_action)
         return list(set(result))
     result = [
         # sync options
-        ("g", "groups", None, None),
-        ("w", "downloadonly", None, None),
-        ("q", "quiet", False, None),
-        ("s", "search", None, None),
+        Arg("g", "groups", None, None),
+        Arg("w", "downloadonly", None, None),
+        Arg("q", "quiet", default=False, doc=None),
+        Arg("s", "search", None, None),
         # universal options
-        ("v", "verbose", None, None),
-        (None, "debug", None, None),
-        (None, "noconfirm", None, None),
-        (None, "needed", False, None),
+        Arg("v", "verbose", None, None),
+        Arg(None, "debug", None, None),
+        Arg(None, "noconfirm", None, None),
+        Arg(None, "needed", default=False, doc=None),
     ]
     if action == "query":
         result += [
-            ("u", "upgrades", None, None),
-            ("o", "owns", None, None),
+            Arg("u", "upgrades", None, None),
+            Arg("o", "owns", None, None),
         ]
     if action in {"sync", "query", "interactive_package_select"}:
         result += [
-            ("l", "list", None, None),
+            Arg("l", "list", None, None),
         ]
     return result
 
 
 def get_pikaur_bool_opts(action: str | None = None) -> ArgSchema:
-    result = []
-    if not action:
+    result: ArgSchema = []
+    if cast(str, "pikaur-static") == PIKAUR_NAME:
+        result += [
+            Arg(
+                None, "force-pacman-cli-db",
+                None,
+                translate("use pacman-cli-based fallback alpm database reader"),
+            ),
+        ]
+    if action == LIST_ALL_ACTIONS:
         for each_action in ALL_ACTIONS:
             result += get_pikaur_bool_opts(each_action)
         return list(set(result))
     if action in {"sync", "pkgbuild", "query", "interactive_package_select"}:
         result += [
-            (
+            Arg(
                 "a", "aur", None,
                 translate("query packages from AUR only"),
             ),
         ]
     if action in {"sync", "pkgbuild", "interactive_package_select"}:
         result += [
-            (
+            Arg(
                 "k", "keepbuild", PikaurConfig().build.KeepBuildDir.get_bool(),
                 translate("don't remove build dir after the build"),
             ),
-            (
+            Arg(
                 None, "keepbuilddeps", PikaurConfig().build.KeepBuildDeps.get_bool(),
                 translate("don't remove build dependencies between and after the builds"),
             ),
-            (
+            Arg(
                 "o", "repo", None, translate("query packages from repository only"),
             ),
-            (
+            Arg(
                 None, "noedit", PikaurConfig().review.NoEdit.get_bool(),
                 translate("don't prompt to edit PKGBUILDs and other build files"),
             ),
-            (
+            Arg(
                 None, "edit", None,
                 translate("prompt to edit PKGBUILDs and other build files"),
             ),
-            (
+            Arg(
                 None, "rebuild", None,
                 translate("always rebuild AUR packages"),
             ),
-            (
+            Arg(
                 None, "skip-failed-build", PikaurConfig().build.SkipFailedBuild.get_bool(),
                 translate("skip failed builds"),
             ),
-            (
+            Arg(
                 None, "dynamic-users", PikaurConfig().build.DynamicUsers.get_str() == "always",
                 translate("always isolate with systemd dynamic users"),
             ),
-            (
+            Arg(
                 None, "hide-build-log", None,
                 translate("hide build log"),
             ),
-            (
+            Arg(
                 None, "skip-aur-pull", None,
                 translate("don't pull already cloned PKGBUILD"),
             ),
         ]
     if action in {"sync", "interactive_package_select"}:
         result += [
-            (
-                None, "namesonly", False,
-                translate("search only in package names"),
+            Arg(
+                None, "namesonly", default=False,
+                doc=translate("search only in package names"),
             ),
-            (
+            Arg(
                 None, "nodiff", PikaurConfig().review.NoDiff.get_bool(),
                 translate("don't prompt to show the build files diff"),
             ),
-            (
+            Arg(
                 None, "ignore-outofdate", PikaurConfig().sync.IgnoreOutofdateAURUpgrades.get_bool(),
                 translate("ignore AUR packages' updates which marked 'outofdate'"),
             ),
         ]
     if action == "query":
         result += [
-            (
+            Arg(
                 None, "repo", None,
-                translate("query packages from repository only")),
+                translate("query packages from repository only"),
+            ),
         ]
     if action == "getpkgbuild":
         result += [
-            (
+            Arg(
                 "d", "deps", None,
                 translate("download also AUR dependencies"),
             ),
         ]
     if action == "pkgbuild":
         result += [
-            (
+            Arg(
                 "i", "install", None,
                 translate("install built package"),
             ),
         ]
+    if action == "extras":
+        result += [
+            Arg(
+                "d", "dep-tree",
+                None,
+                translate("visualize package dependency tree"),
+            ),
+            Arg(
+                "q", "quiet", None,
+                translate("less verbose output"),
+                help_only=True,
+            ),
+        ]
     result += [
-        (
+        Arg(
             None, "print-commands", PikaurConfig().ui.PrintCommands.get_bool(),
             translate("print spawned by pikaur subshell commands"),
         ),
-        (
+        Arg(
             None, "pikaur-debug", None,
             translate("show only debug messages specific to pikaur"),
         ),
         # undocumented options:
-        (None, "print-args-and-exit", None, None),
+        Arg(None, "print-args-and-exit", None, None),
     ]
     return result
 
 
 def get_pacman_str_opts(action: str | None = None) -> ArgSchema:
-    if not action:
+    if action == LIST_ALL_ACTIONS:
         result = []
         for each_action in ALL_PACMAN_ACTIONS:
             result += get_pacman_str_opts(each_action)
         return list(set(result))
     return [
-        (None, "color", None, None),
-        ("b", "dbpath", None, None),  # @TODO: pyalpm?
-        ("r", "root", None, None),
-        (None, "arch", None, None),  # @TODO
-        (None, "cachedir", None, None),  # @TODO
-        (None, "config", None, None),
-        (None, "gpgdir", None, None),
-        (None, "hookdir", None, None),
-        (None, "logfile", None, None),
-        (None, "print-format", None, None),  # @TODO
+        Arg(None, "color", None, None),
+        Arg("b", "dbpath", None, None),
+        Arg("r", "root", None, None),
+        Arg(None, "arch", None, None),  # @TODO
+        Arg(None, "cachedir", None, None),  # @TODO
+        Arg(None, "config", None, None),
+        Arg(None, "gpgdir", None, None),
+        Arg(None, "hookdir", None, None),
+        Arg(None, "logfile", None, None),
+        Arg(None, "print-format", None, None),  # @TODO
     ]
 
 
@@ -233,64 +277,77 @@ class ColorFlagValues:
 
 def get_pikaur_str_opts(action: str | None = None) -> ArgSchema:
     result: ArgSchema = [
-        (
+        Arg(
             None, "home-dir",
             None,
             translate("alternative home directory location"),
         ),
-        (
+        Arg(
             None, "xdg-cache-home",
             PikaurConfig().misc.CachePath.get_str(),
             translate("alternative package cache directory location"),
         ),
-        (
+        Arg(
             None, "xdg-config-home",
             None,
             translate("alternative configuration file directory location"),
         ),
-        (
+        Arg(
             None, "xdg-data-home",
             PikaurConfig().misc.DataPath.get_str(),
             translate("alternative database directory location"),
         ),
-        (
+        Arg(
             None, "preserve-env",
             PikaurConfig().misc.PreserveEnv.get_str(),
             translate("preserve environment variables (comma-separated)"),
         ),
+        Arg(
+            None, "pacman-path",
+            PikaurConfig().misc.PacmanPath.get_str(),
+            translate("override path to pacman executable"),
+        ),
     ]
-    if not action:
+    if cast(str, "pikaur-static") == PIKAUR_NAME:
+        result += [
+            Arg(
+                None, "pacman-conf-path",
+                "pacman-conf",
+                translate("override path to pacman-conf executable"),
+            ),
+        ]
+    if action == LIST_ALL_ACTIONS:
         for each_action in ALL_ACTIONS:
             result += get_pikaur_str_opts(each_action)
         return list(set(result))
     if action in {"sync", "pkgbuild", "interactive_package_select"}:
         result += [
-            (
+            Arg(
                 None, "mflags",
                 None,
                 translate("cli args to pass to makepkg"),
             ),
-            (
+            Arg(
                 None, "makepkg-config",
                 None,
                 translate("path to custom makepkg config"),
             ),
-            (
+            Arg(
                 None, "makepkg-path",
                 None,
                 translate("override path to makepkg executable"),
             ),
-            (
+            Arg(
                 None, "pikaur-config",
                 None,
                 translate("path to custom pikaur config"),
             ),
-            (
+            Arg(
                 None, "build-gpgdir",
                 PikaurConfig().build.GpgDir.get_str(),
                 translate("set GnuPG home directory used when validating package sources"),
             ),
-            (
+            Arg(
                 None, "privilege-escalation-target",
                 PikaurConfig().misc.PrivilegeEscalationTarget.get_str(),
                 None,
@@ -298,7 +355,7 @@ def get_pikaur_str_opts(action: str | None = None) -> ArgSchema:
         ]
     if action == "getpkgbuild":
         result += [
-            (
+            Arg(
                 "o", "output-dir",
                 None,
                 translate("path where to clone PKGBUILDs"),
@@ -309,62 +366,70 @@ def get_pikaur_str_opts(action: str | None = None) -> ArgSchema:
 
 def get_pikaur_int_opts(action: str | None = None) -> ArgSchema:
     result = []
-    if not action:
+    if action == LIST_ALL_ACTIONS:
         for each_action in ALL_ACTIONS:
             result += get_pikaur_int_opts(each_action)
         return list(set(result))
     if action in {"sync", "pkgbuild", "interactive_package_select"}:
         result += [
-            (
+            Arg(
                 None, "aur-clone-concurrency", None,
                 translate("how many git-clones/pulls to do from AUR"),
             ),
-            (
+            Arg(
                 None, "user-id", PikaurConfig().misc.UserId.get_int(),
                 translate("user ID to run makepkg if pikaur started from root"),
+            ),
+        ]
+    if action == "extras":
+        result += [
+            Arg(
+                "l", "level",
+                2,
+                translate("dependency tree level"),
             ),
         ]
     return result
 
 
 def get_pacman_count_opts(action: str | None = None) -> ArgSchema:
-    if not action:
+    if action == LIST_ALL_ACTIONS:
         result = []
         for each_action in ALL_PACMAN_ACTIONS:
             result += get_pacman_count_opts(each_action)
         return list(set(result))
     result = [
-        ("y", "refresh", 0, None),
-        ("c", "clean", 0, None),
+        Arg("y", "refresh", 0, None),
+        Arg("c", "clean", 0, None),
     ]
     if action in {"sync", "interactive_package_select"}:
         result += [
-            ("u", "sysupgrade", 0, None),
+            Arg("u", "sysupgrade", 0, None),
         ]
     if action in {"sync", "query", "interactive_package_select"}:
         result += [
-            ("i", "info", 0, None),
+            Arg("i", "info", 0, None),
         ]
     if action in {"database", "query"}:
         result += [
-            ("k", "check", 0, None),
+            Arg("k", "check", 0, None),
         ]
     if action in ALL_PACMAN_ACTIONS:
         result += [
-            ("d", "nodeps", 0, None),
+            Arg("d", "nodeps", 0, None),
         ]
     return result
 
 
 def get_pikaur_count_opts(action: str | None = None) -> ArgSchema:
     result = []
-    if not action:
+    if action == LIST_ALL_ACTIONS:
         for each_action in ALL_ACTIONS:
             result += get_pikaur_count_opts(each_action)
         return list(set(result))
     if action in {"sync", "interactive_package_select"}:
         result += [
-            (
+            Arg(
                 None, "devel", 0,
                 translate("always sysupgrade '-git', '-svn' and other dev packages"),
             ),
@@ -373,10 +438,10 @@ def get_pikaur_count_opts(action: str | None = None) -> ArgSchema:
 
 
 PACMAN_APPEND_OPTS: "Final[ArgSchema]" = [
-    (None, "ignore", None, None),
-    (None, "ignoregroup", None, None),  # @TODO
-    (None, "overwrite", None, None),
-    (None, "assume-installed", None, None),  # @TODO
+    Arg(None, "ignore", None, None),
+    Arg(None, "ignoregroup", None, None),  # @TODO
+    Arg(None, "overwrite", None, None),
+    Arg(None, "assume-installed", None, None),  # @TODO
 ]
 
 
@@ -393,28 +458,28 @@ ARG_CONFLICTS: "Final[dict[str, dict[str, list[str]]]]" = {
 }
 
 
-def get_all_pikaur_options() -> ArgSchema:
+def get_all_pikaur_options(action: str | None = None) -> ArgSchema:
     return (
         PIKAUR_ACTIONS +
-        get_pikaur_bool_opts() +
-        get_pikaur_str_opts() +
-        get_pikaur_count_opts() +
-        get_pikaur_int_opts()
+        get_pikaur_bool_opts(action=action) +
+        get_pikaur_str_opts(action=action) +
+        get_pikaur_count_opts(action=action) +
+        get_pikaur_int_opts(action=action)
     )
 
 
 def get_pikaur_long_opts() -> list[str]:
     return [
-        long_opt.replace("-", "_")
-        for _short_opt, long_opt, _default, _help in get_all_pikaur_options()
-        if long_opt is not None
+        arg.long.replace("-", "_")
+        for arg in get_all_pikaur_options()
+        if (arg.long is not None) and (not arg.help_only)
     ]
 
 
 def get_pacman_long_opts() -> list[str]:  # pragma: no cover
     return [
         long_opt.replace("-", "_")
-        for _short_opt, long_opt, _default, _help
+        for _short_opt, long_opt, _default, _help, help_only
         in (
             PACMAN_ACTIONS +
             get_pacman_bool_opts() +
@@ -422,7 +487,7 @@ def get_pacman_long_opts() -> list[str]:  # pragma: no cover
             PACMAN_APPEND_OPTS +
             get_pacman_count_opts()
         )
-        if long_opt is not None
+        if (long_opt is not None) and (not help_only)
     ]
 
 
@@ -437,33 +502,43 @@ class MissingArgumentError(Exception):
 class PikaurArgs(Namespace):
     unknown_args: list[str]
     raw: list[str]
+
     # typehints:
-    info: bool | None
-    keepbuild: bool | None
-    output_dir: str | None
     # @TODO: remove? :
     # nodeps: bool | None
     # owns: bool | None
     # check: bool | None
-    ignore: list[str]
-    makepkg_config: str | None
-    mflags: str | None
-    makepkg_path: str | None
-    quiet: bool
-    sysupgrade: int
-    devel: int
-    namesonly: bool
-    build_gpgdir: str
-    needed: bool
-    config: str | None
-    refresh: int
-    clean: int
     aur_clone_concurrency: int | None
-    skip_aur_pull: bool | None
-    positional: list[str]
-    read_stdin: bool = False
-    preserve_env: str = ""
+    build_gpgdir: str
+    clean: int
+    config: str | None
+    dbpath: str | None
+    devel: int
+    ignore: list[str]
+    info: bool | None
     interactive_package_select: bool = False
+    keepbuild: bool | None
+    level: int
+    makepkg_config: str | None
+    makepkg_path: str | None
+    mflags: str | None
+    namesonly: bool
+    needed: bool
+    output_dir: str | None
+    pacman_conf_path: str
+    pacman_path: str
+    positional: list[str]
+    preserve_env: str = ""
+    quiet: bool
+    read_stdin: bool = False
+    refresh: int
+    root: str | None
+    skip_aur_pull: bool | None
+    sysupgrade: int
+
+    def __init__(self) -> None:
+        self.positional = []
+        super().__init__()
 
     def __getattr__(self, name: str) -> PossibleArgValuesTypes:
         transformed_name = name.replace("-", "_")
@@ -495,14 +570,14 @@ class PikaurArgs(Namespace):
             self.interactive_package_select = True
 
     def validate(self) -> None:
-        for operation, operation_depends in ARG_DEPENDS.items():  # noqa: PLR1702
+        for operation, operation_depends in ARG_DEPENDS.items():
             if getattr(self, operation):
                 for arg_depend_on, dependant_args in operation_depends.items():
                     if not getattr(self, arg_depend_on):
                         for arg_name in dependant_args:
                             if getattr(self, arg_name):
                                 raise MissingArgumentError(arg_depend_on, arg_name)
-        for operation, operation_conflicts in ARG_CONFLICTS.items():  # noqa: PLR1702
+        for operation, operation_conflicts in ARG_CONFLICTS.items():
             if getattr(self, operation):
                 for args_conflicts, conflicting_args in operation_conflicts.items():
                     if getattr(self, args_conflicts):
@@ -545,12 +620,14 @@ class PikaurArgumentParser(ArgumentParserWithUnknowns):
         super().error(message)
 
     def parse_pikaur_args(self, raw_args: list[str]) -> PikaurArgs:
-        parsed_args, unknown_args = self.parse_known_args(raw_args)
-        for arg in unknown_args[:]:
-            if arg.startswith("-"):
-                continue
-            unknown_args.remove(arg)
-            parsed_args.positional.append(arg)
+        extra_positionals = []
+        args_to_parse = raw_args.copy()
+        if "--" in raw_args:
+            separator_index = args_to_parse.index("--")
+            extra_positionals = args_to_parse[separator_index + 1:]
+            args_to_parse = args_to_parse[:separator_index]
+        parsed_args, unknown_args = self.parse_known_args(args_to_parse)
+        parsed_args.positional += extra_positionals
         return PikaurArgs.from_namespace(
             namespace=parsed_args,
             unknown_args=unknown_args,
@@ -559,6 +636,7 @@ class PikaurArgumentParser(ArgumentParserWithUnknowns):
 
     def add_letter_andor_opt(
             self,
+            *,
             action: str | None = None,
             letter: str | None = None,
             opt: str | None = None,
@@ -651,19 +729,18 @@ def get_parser_for_action(
 
     parser = PikaurArgumentParser(prog=app, add_help=False)
     parser.add_argument("positional", nargs="*")
-    for letter, opt, default, _help in (
+    for arg in (
             PACMAN_ACTIONS + PIKAUR_ACTIONS
     ):
-        parser.add_letter_andor_opt(
-            action="store_true", letter=letter, opt=opt, default=default,
-        )
+        if not arg.help_only:
+            parser.add_letter_andor_opt(
+                action="store_true", letter=arg.short, opt=arg.long, default=arg.default,
+            )
     parsed_action = parser.parse_pikaur_args(args)
     pikaur_action: str | None = None
     for action_name in ALL_ACTIONS:
         if getattr(parsed_action, action_name) and action_name != "help":
             pikaur_action = action_name
-    if pikaur_action is None:
-        return parser, []
 
     help_msgs: list[HelpMessage] = []
     for action_type, opt_list, is_pikaur, arg_type in (
@@ -676,19 +753,24 @@ def get_parser_for_action(
             (None, get_pikaur_str_opts(action=pikaur_action), True, None),
             (None, get_pikaur_int_opts(action=pikaur_action), True, int),
     ):
-        for letter, opt, default, help_msg in opt_list:
-            if arg_type:
-                parser.add_letter_andor_opt(
-                    action=action_type, letter=letter, opt=opt, default=default, arg_type=arg_type,
-                )
-            else:
-                parser.add_letter_andor_opt(
-                    action=action_type, letter=letter, opt=opt, default=default,
-                )
+        for arg in opt_list:
+            if not arg.help_only:
+                if arg_type:
+                    parser.add_letter_andor_opt(
+                        action=action_type, letter=arg.short, opt=arg.long, default=arg.default,
+                        arg_type=arg_type,
+                    )
+                else:
+                    parser.add_letter_andor_opt(
+                        action=action_type, letter=arg.short, opt=arg.long, default=arg.default,
+                    )
             if is_pikaur:
                 help_msgs.append(
-                    (letter, opt, help_msg),
+                    HelpMessage(arg.short, arg.long, arg.doc),
                 )
+
+    if pikaur_action is None:
+        return parser, []
     return parser, help_msgs
 
 
@@ -712,15 +794,17 @@ def _parse_args(args: list[str] | None = None) -> tuple[PikaurArgs, list[HelpMes
     try:
         parsed_args.validate()
     except IncompatibleArgumentsError as exc:
-        print_stderr(translate(":: error: options {} can't be used together.").format(
-            ", ".join([f"'--{opt}'" for opt in exc.args]),
-        ))
+        print_error(
+            translate("options {} can't be used together.").format(
+                ", ".join([f"'--{opt}'" for opt in exc.args]),
+            ),
+        )
         sys.exit(1)
     except MissingArgumentError as exc:
-        print_stderr(
+        print_error(
             translate_many(
-                ":: error: option {} can't be used without {}.",
-                ":: error: options {} can't be used without {}.",
+                "option {} can't be used without {}.",
+                "options {} can't be used without {}.",
                 len(exc.args[1:]),
             ).format(
                 ", ".join([f"'--{opt}'" for opt in exc.args[1:]]),
@@ -747,17 +831,19 @@ def get_help() -> list[HelpMessage]:
 def reconstruct_args(parsed_args: PikaurArgs, ignore_args: list[str] | None = None) -> list[str]:
     if not ignore_args:
         ignore_args = []
-    for _letter, opt, _default, _help in get_all_pikaur_options():
-        # if letter:
-        #     ignore_args.append(letter)
-        if opt:
-            ignore_args.append(opt.replace("-", "_"))
+    for arg in get_all_pikaur_options(
+            action=LIST_ALL_ACTIONS,
+    ):
+        if arg.long and not arg.help_only:
+            ignore_args.append(arg.long.replace("-", "_"))
     count_args = []
-    for letter, opt, _default, _help in get_pacman_count_opts():
-        if letter:
-            count_args.append(letter)
-        if opt:
-            count_args.append(opt.replace("-", "_"))
+    for arg in get_pacman_count_opts(action=LIST_ALL_ACTIONS):
+        if arg.help_only:
+            continue
+        if arg.short:
+            count_args.append(arg.short)
+        if arg.long:
+            count_args.append(arg.long.replace("-", "_"))
     reconstructed_args = {
         f"--{key}" if len(key) > 1 else f"-{key}": value
         for key, value in vars(parsed_args).items()
@@ -765,21 +851,23 @@ def reconstruct_args(parsed_args: PikaurArgs, ignore_args: list[str] | None = No
         if key not in ignore_args + count_args + [
             "raw", "unknown_args", "positional", "read_stdin",  # computed members
         ] + [
-            long_arg
-            for _short_arg, long_arg, default, _help in get_pacman_str_opts() + PACMAN_APPEND_OPTS
-            if long_arg
+            arg.long
+            for arg in get_pacman_str_opts(
+                action=LIST_ALL_ACTIONS,
+            ) + PACMAN_APPEND_OPTS
+            if arg.long and not arg.help_only
         ]
     }
     result = list(set(
         list(reconstructed_args.keys()) + parsed_args.unknown_args,
     ))
     for args_key, value in vars(parsed_args).items():
-        for letter, long, _default, _help in (
-                get_pacman_count_opts()
+        for arg in (
+                get_pacman_count_opts(action=LIST_ALL_ACTIONS)
         ):
-            if not long:
+            if (not arg.long) or arg.help_only:
                 continue
-            opt = long.replace("-", "_")
+            opt = arg.long.replace("-", "_")
             if (
                     value
                     and (
@@ -787,7 +875,7 @@ def reconstruct_args(parsed_args: PikaurArgs, ignore_args: list[str] | None = No
                     ) and (
                         opt not in ignore_args
                     ) and (
-                        letter not in ignore_args
+                        arg.short not in ignore_args
                     )
             ):
                 result += ["--" + opt] * value
